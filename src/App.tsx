@@ -24,13 +24,19 @@ export default function App() {
   const [isInteracting, setIsInteracting] = useState(false);
   const [startPan, setStartPan] = useState({ x: 0, y: 0 });
 
-  // active tool mode
+  // active tool mode & brush settings
   const [activeTool, setActiveTool] = useState<'pan' | 'select' | 'draw'>('select');
+  const [brushColor, setBrushColor] = useState('#38bdf8');
+  const [currentPath, setCurrentPath] = useState<{ x: number; y: number }[]>([]);
 
   // selection & dragging state
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [isResizing, setIsResizing] = useState(false);
   const [dragOffset, setDragOffset] = useState({ x: 0, y: 0 });
+
+  // inline sticky note editing state
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editText, setEditText] = useState('');
 
   const [elements, setElements] = useState<CanvasElement[]>([]);
   const [activeUsers, setActiveUsers] = useState<number>(1);
@@ -116,7 +122,7 @@ export default function App() {
         ctx.stroke();
       }
 
-      // render shapes and handle selection bounding boxes
+      // render shapes, paths, and handles
       elements.forEach((el) => {
         const isSelected = el.id === selectedId;
 
@@ -138,9 +144,35 @@ export default function App() {
             ctx.fillRect(el.x + w - handleSize / 2, el.y + h - handleSize / 2, handleSize, handleSize);
           }
 
-          ctx.fillStyle = '#0f172a';
-          ctx.font = 'bold 15px sans-serif';
-          ctx.fillText(el.text || '', el.x + 12, el.y + 30);
+          if (editingId !== el.id) {
+            ctx.fillStyle = '#0f172a';
+            ctx.font = 'bold 15px sans-serif';
+
+            const words = (el.text || '').split(' ');
+            let line = '';
+            let posY = el.y + 30;
+            const maxWidth = w - 24;
+
+            for (let n = 0; n < words.length; n++) {
+              const testLine = line + words[n] + ' ';
+              if (ctx.measureText(testLine).width > maxWidth && n > 0) {
+                ctx.fillText(line, el.x + 12, posY);
+                line = words[n] + ' ';
+                posY += 20;
+              } else {
+                line = testLine;
+              }
+            }
+            ctx.fillText(line, el.x + 12, posY);
+          }
+        } else if (el.type === 'path' && el.points && el.points.length > 0) {
+          ctx.strokeStyle = el.color;
+          ctx.lineWidth = Math.max(2, 3 / viewport.scale);
+          ctx.lineCap = 'round';
+          ctx.beginPath();
+          ctx.moveTo(el.points[0].x, el.points[0].y);
+          el.points.forEach((point) => ctx.lineTo(point.x, point.y));
+          ctx.stroke();
         } else if (el.type === 'circle' && el.x !== undefined && el.y !== undefined && el.radius) {
           ctx.beginPath();
           ctx.arc(el.x, el.y, el.radius, 0, Math.PI * 2);
@@ -174,7 +206,7 @@ export default function App() {
     return () => {
       window.removeEventListener('resize', handleResize);
     };
-  }, [viewport, elements, selectedId]);
+  }, [viewport, elements, selectedId, editingId]);
 
   // convert screen center to active world coordinates
   const getCenterWorldPos = () => ({
@@ -194,7 +226,7 @@ export default function App() {
       y: pos.y - 70,
       width: 180,
       height: 140,
-      text: 'Sticky Note',
+      text: 'Double click to edit',
       color: noteColors[Math.floor(Math.random() * noteColors.length)],
     });
   };
@@ -237,14 +269,12 @@ export default function App() {
         const h = el.height || (el.type === 'sticky' ? 140 : 100);
         if (el.x === undefined || el.y === undefined) continue;
 
-        // check bottom-right resize handle
         const handleX = el.x + w;
         const handleY = el.y + h;
         if (Math.abs(worldX - handleX) <= handleThreshold && Math.abs(worldY - handleY) <= handleThreshold) {
           return { element: el, isResizeHandle: true };
         }
 
-        // check main body bounding box
         if (worldX >= el.x && worldX <= el.x + w && worldY >= el.y && worldY <= el.y + h) {
           return { element: el, isResizeHandle: false };
         }
@@ -271,6 +301,8 @@ export default function App() {
 
     if (activeTool === 'pan' || e.button === 1) {
       setStartPan({ x: e.clientX - viewport.x, y: e.clientY - viewport.y });
+    } else if (activeTool === 'draw') {
+      setCurrentPath([{ x: worldX, y: worldY }]);
     } else if (activeTool === 'select') {
       const hit = getElementHitInfo(worldX, worldY);
       if (hit) {
@@ -283,8 +315,23 @@ export default function App() {
         }
       } else {
         setSelectedId(null);
+        setEditingId(null);
         setIsResizing(false);
       }
+    }
+  };
+
+  const handleDoubleClick = (e: React.MouseEvent) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    const worldX = (e.clientX - rect.left - viewport.x) / viewport.scale;
+    const worldY = (e.clientY - rect.top - viewport.y) / viewport.scale;
+
+    const hit = getElementHitInfo(worldX, worldY);
+    if (hit && hit.element.type === 'sticky') {
+      setEditingId(hit.element.id);
+      setEditText(hit.element.text || '');
     }
   };
 
@@ -302,6 +349,16 @@ export default function App() {
         x: e.clientX - startPan.x,
         y: e.clientY - startPan.y,
       }));
+    } else if (activeTool === 'draw') {
+      const updatedPath = [...currentPath, { x: worldX, y: worldY }];
+      setCurrentPath(updatedPath);
+
+      elementsMapRef.current?.set('temp-path', {
+        id: 'temp-path',
+        type: 'path',
+        color: brushColor,
+        points: updatedPath,
+      });
     } else if (activeTool === 'select' && selectedId) {
       const existing = elementsMapRef.current?.get(selectedId);
       if (!existing) return;
@@ -325,8 +382,21 @@ export default function App() {
   };
 
   const handleMouseUp = () => {
+    if (!isInteracting) return;
     setIsInteracting(false);
     setIsResizing(false);
+
+    if (activeTool === 'draw' && currentPath.length > 0) {
+      const uniqueId = Math.random().toString(36).substring(2, 9);
+      elementsMapRef.current?.set(uniqueId, {
+        id: uniqueId,
+        type: 'path',
+        color: brushColor,
+        points: currentPath,
+      });
+      elementsMapRef.current?.delete('temp-path');
+      setCurrentPath([]);
+    }
   };
 
   const handleWheel = (e: React.WheelEvent) => {
@@ -335,6 +405,27 @@ export default function App() {
     const newScale = Math.min(Math.max(0.1, viewport.scale * zoomFactor), 5);
     setViewport((prev) => ({ ...prev, scale: newScale }));
   };
+
+  const saveTextEdit = () => {
+    if (editingId) {
+      const existing = elementsMapRef.current?.get(editingId);
+      if (existing) {
+        elementsMapRef.current?.set(editingId, {
+          ...existing,
+          text: editText,
+        });
+      }
+      setEditingId(null);
+    }
+  };
+
+  const activeEditingElement = elements.find((el) => el.id === editingId);
+  const editingScreenBounds = activeEditingElement && activeEditingElement.x !== undefined && activeEditingElement.y !== undefined ? {
+    left: activeEditingElement.x * viewport.scale + viewport.x + 12,
+    top: activeEditingElement.y * viewport.scale + viewport.y + 12,
+    width: (activeEditingElement.width || 180) * viewport.scale - 24,
+    height: (activeEditingElement.height || 140) * viewport.scale - 24,
+  } : null;
 
   return (
     <div style={{ width: '100vw', height: '100vh', overflow: 'hidden', background: '#0f172a', position: 'relative', fontFamily: 'sans-serif' }}>
@@ -345,6 +436,9 @@ export default function App() {
         </button>
         <button onClick={() => setActiveTool('select')} style={{ padding: '8px 12px', background: activeTool === 'select' ? '#3b82f6' : '#334155', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold' }}>
           ↖ Select & Resize
+        </button>
+        <button onClick={() => setActiveTool('draw')} style={{ padding: '8px 12px', background: activeTool === 'draw' ? '#3b82f6' : '#334155', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold' }}>
+          ✏️ Draw
         </button>
 
         <div style={{ width: '1px', height: '24px', background: '#475569', margin: '0 2px' }} />
@@ -359,18 +453,54 @@ export default function App() {
           🟦 Rect
         </button>
 
+        {activeTool === 'draw' && (
+          <input type="color" value={brushColor} onChange={(e) => setBrushColor(e.target.value)} style={{ width: '28px', height: '28px', border: 'none', cursor: 'pointer', background: 'none' }} />
+        )}
+
         <div style={{ padding: '6px 10px', background: '#0f172a', color: '#38bdf8', borderRadius: '6px', border: '1px solid #334155', fontSize: '13px', fontWeight: 500, marginLeft: '8px' }}>
           Online: {activeUsers}
         </div>
       </div>
+
+      {/* inline textarea overlay for editing sticky note text */}
+      {editingId && editingScreenBounds && (
+        <textarea
+          autoFocus
+          value={editText}
+          onChange={(e) => setEditText(e.target.value)}
+          onBlur={saveTextEdit}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter' && !e.shiftKey) {
+              e.preventDefault();
+              saveTextEdit();
+            }
+          }}
+          style={{
+            position: 'absolute',
+            left: `${editingScreenBounds.left}px`,
+            top: `${editingScreenBounds.top}px`,
+            width: `${editingScreenBounds.width}px`,
+            height: `${editingScreenBounds.height}px`,
+            fontSize: `${Math.max(12, 15 * viewport.scale)}px`,
+            fontFamily: 'sans-serif',
+            color: '#0f172a',
+            background: 'transparent',
+            border: '1px dashed #0f172a',
+            outline: 'none',
+            resize: 'none',
+            zIndex: 20,
+          }}
+        />
+      )}
 
       <canvas
         ref={canvasRef}
         onMouseDown={handleMouseDown}
         onMouseMove={handleMouseMove}
         onMouseUp={handleMouseUp}
+        onDoubleClick={handleDoubleClick}
         onWheel={handleWheel}
-        style={{ display: 'block', cursor: activeTool === 'pan' ? 'grab' : 'default' }}
+        style={{ display: 'block', cursor: activeTool === 'pan' ? 'grab' : activeTool === 'draw' ? 'crosshair' : 'default' }}
       />
     </div>
   );
