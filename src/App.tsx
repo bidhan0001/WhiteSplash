@@ -27,6 +27,11 @@ export default function App() {
   // active tool mode
   const [activeTool, setActiveTool] = useState<'pan' | 'select' | 'draw'>('select');
 
+  // selection & dragging state
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [isResizing, setIsResizing] = useState(false);
+  const [dragOffset, setDragOffset] = useState({ x: 0, y: 0 });
+
   const [elements, setElements] = useState<CanvasElement[]>([]);
   const [activeUsers, setActiveUsers] = useState<number>(1);
 
@@ -111,14 +116,27 @@ export default function App() {
         ctx.stroke();
       }
 
-      // render shapes from collaborative state
+      // render shapes and handle selection bounding boxes
       elements.forEach((el) => {
+        const isSelected = el.id === selectedId;
+
         if (el.type === 'sticky' && el.x !== undefined && el.y !== undefined) {
           const w = el.width || 180;
           const h = el.height || 140;
 
           ctx.fillStyle = el.color;
           ctx.fillRect(el.x, el.y, w, h);
+
+          if (isSelected) {
+            ctx.strokeStyle = '#38bdf8';
+            ctx.lineWidth = 2 / viewport.scale;
+            ctx.strokeRect(el.x - 2, el.y - 2, w + 4, h + 4);
+
+            // resize handle
+            ctx.fillStyle = '#38bdf8';
+            const handleSize = 10 / viewport.scale;
+            ctx.fillRect(el.x + w - handleSize / 2, el.y + h - handleSize / 2, handleSize, handleSize);
+          }
 
           ctx.fillStyle = '#0f172a';
           ctx.font = 'bold 15px sans-serif';
@@ -128,17 +146,23 @@ export default function App() {
           ctx.arc(el.x, el.y, el.radius, 0, Math.PI * 2);
           ctx.fillStyle = el.color;
           ctx.fill();
-          ctx.lineWidth = 2;
-          ctx.strokeStyle = '#ffffff';
+          ctx.lineWidth = isSelected ? 3 : 2;
+          ctx.strokeStyle = isSelected ? '#38bdf8' : '#ffffff';
           ctx.stroke();
         } else if (el.type === 'rectangle' && el.x !== undefined && el.y !== undefined) {
           const w = el.width || 150;
           const h = el.height || 100;
           ctx.fillStyle = el.color;
           ctx.fillRect(el.x, el.y, w, h);
-          ctx.lineWidth = 2;
-          ctx.strokeStyle = '#ffffff';
+          ctx.lineWidth = isSelected ? 3 : 2;
+          ctx.strokeStyle = isSelected ? '#38bdf8' : '#ffffff';
           ctx.strokeRect(el.x, el.y, w, h);
+
+          if (isSelected) {
+            ctx.fillStyle = '#38bdf8';
+            const handleSize = 10 / viewport.scale;
+            ctx.fillRect(el.x + w - handleSize / 2, el.y + h - handleSize / 2, handleSize, handleSize);
+          }
         }
       });
 
@@ -150,7 +174,7 @@ export default function App() {
     return () => {
       window.removeEventListener('resize', handleResize);
     };
-  }, [viewport, elements]);
+  }, [viewport, elements, selectedId]);
 
   // convert screen center to active world coordinates
   const getCenterWorldPos = () => ({
@@ -158,7 +182,6 @@ export default function App() {
     y: (window.innerHeight / 2 - viewport.y) / viewport.scale,
   });
 
-  // add sticky note centered relative to view
   const addStickyNote = () => {
     const id = Math.random().toString(36).substring(2, 9);
     const pos = getCenterWorldPos();
@@ -171,12 +194,11 @@ export default function App() {
       y: pos.y - 70,
       width: 180,
       height: 140,
-      text: 'Double click to edit',
+      text: 'Sticky Note',
       color: noteColors[Math.floor(Math.random() * noteColors.length)],
     });
   };
 
-  // add circle shape
   const addCircle = () => {
     const id = Math.random().toString(36).substring(2, 9);
     const pos = getCenterWorldPos();
@@ -190,7 +212,6 @@ export default function App() {
     });
   };
 
-  // add rectangle shape
   const addRectangle = () => {
     const id = Math.random().toString(36).substring(2, 9);
     const pos = getCenterWorldPos();
@@ -205,27 +226,107 @@ export default function App() {
     });
   };
 
-  // canvas pan handlers
+  // test if world click hits an element or its resize handle
+  const getElementHitInfo = (worldX: number, worldY: number) => {
+    const handleThreshold = 12 / viewport.scale;
+
+    for (let i = elements.length - 1; i >= 0; i--) {
+      const el = elements[i];
+      if (el.type === 'sticky' || el.type === 'rectangle') {
+        const w = el.width || (el.type === 'sticky' ? 180 : 150);
+        const h = el.height || (el.type === 'sticky' ? 140 : 100);
+        if (el.x === undefined || el.y === undefined) continue;
+
+        // check bottom-right resize handle
+        const handleX = el.x + w;
+        const handleY = el.y + h;
+        if (Math.abs(worldX - handleX) <= handleThreshold && Math.abs(worldY - handleY) <= handleThreshold) {
+          return { element: el, isResizeHandle: true };
+        }
+
+        // check main body bounding box
+        if (worldX >= el.x && worldX <= el.x + w && worldY >= el.y && worldY <= el.y + h) {
+          return { element: el, isResizeHandle: false };
+        }
+      } else if (el.type === 'circle' && el.radius) {
+        if (el.x === undefined || el.y === undefined) continue;
+        const dx = worldX - el.x;
+        const dy = worldY - el.y;
+        if (Math.sqrt(dx * dx + dy * dy) <= el.radius) {
+          return { element: el, isResizeHandle: false };
+        }
+      }
+    }
+    return null;
+  };
+
   const handleMouseDown = (e: React.MouseEvent) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    const worldX = (e.clientX - rect.left - viewport.x) / viewport.scale;
+    const worldY = (e.clientY - rect.top - viewport.y) / viewport.scale;
+
+    setIsInteracting(true);
+
     if (activeTool === 'pan' || e.button === 1) {
-      setIsInteracting(true);
       setStartPan({ x: e.clientX - viewport.x, y: e.clientY - viewport.y });
+    } else if (activeTool === 'select') {
+      const hit = getElementHitInfo(worldX, worldY);
+      if (hit) {
+        setSelectedId(hit.element.id);
+        if (hit.isResizeHandle) {
+          setIsResizing(true);
+        } else if (hit.element.x !== undefined && hit.element.y !== undefined) {
+          setIsResizing(false);
+          setDragOffset({ x: worldX - hit.element.x, y: worldY - hit.element.y });
+        }
+      } else {
+        setSelectedId(null);
+        setIsResizing(false);
+      }
     }
   };
 
   const handleMouseMove = (e: React.MouseEvent) => {
     if (!isInteracting) return;
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    const worldX = (e.clientX - rect.left - viewport.x) / viewport.scale;
+    const worldY = (e.clientY - rect.top - viewport.y) / viewport.scale;
+
     if (activeTool === 'pan' || e.buttons === 4) {
       setViewport((prev) => ({
         ...prev,
         x: e.clientX - startPan.x,
         y: e.clientY - startPan.y,
       }));
+    } else if (activeTool === 'select' && selectedId) {
+      const existing = elementsMapRef.current?.get(selectedId);
+      if (!existing) return;
+
+      if (isResizing && existing.x !== undefined && existing.y !== undefined) {
+        const newWidth = Math.max(60, worldX - existing.x);
+        const newHeight = Math.max(50, worldY - existing.y);
+        elementsMapRef.current?.set(selectedId, {
+          ...existing,
+          width: newWidth,
+          height: newHeight,
+        });
+      } else if (!isResizing) {
+        elementsMapRef.current?.set(selectedId, {
+          ...existing,
+          x: worldX - dragOffset.x,
+          y: worldY - dragOffset.y,
+        });
+      }
     }
   };
 
   const handleMouseUp = () => {
     setIsInteracting(false);
+    setIsResizing(false);
   };
 
   const handleWheel = (e: React.WheelEvent) => {
@@ -243,7 +344,7 @@ export default function App() {
           ✋ Pan
         </button>
         <button onClick={() => setActiveTool('select')} style={{ padding: '8px 12px', background: activeTool === 'select' ? '#3b82f6' : '#334155', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold' }}>
-          ↖ Select
+          ↖ Select & Resize
         </button>
 
         <div style={{ width: '1px', height: '24px', background: '#475569', margin: '0 2px' }} />
