@@ -16,6 +16,11 @@ interface CanvasElement {
   points?: { x: number; y: number }[];
 }
 
+interface PeerState {
+  hasVideo?: boolean;
+  peerId?: string;
+}
+
 export default function App() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
@@ -23,6 +28,9 @@ export default function App() {
   const [viewport, setViewport] = useState({ x: 0, y: 0, scale: 1 });
   const [isInteracting, setIsInteracting] = useState(false);
   const [startPan, setStartPan] = useState({ x: 0, y: 0 });
+
+  // canvas background color state
+  const [bgColor, setBgColor] = useState('#0f172a');
 
   // active tool mode & brush settings
   const [activeTool, setActiveTool] = useState<'pan' | 'select' | 'draw'>('select');
@@ -42,6 +50,7 @@ export default function App() {
   const localVideoRef = useRef<HTMLVideoElement | null>(null);
   const [isVideoActive, setIsVideoActive] = useState(false);
   const mediaStreamRef = useRef<MediaStream | null>(null);
+  const [peerStates, setPeerStates] = useState<PeerState[]>([]);
 
   const [elements, setElements] = useState<CanvasElement[]>([]);
   const [activeUsers, setActiveUsers] = useState<number>(1);
@@ -50,6 +59,7 @@ export default function App() {
   const ydocRef = useRef<Y.Doc | null>(null);
   const elementsMapRef = useRef<Y.Map<CanvasElement> | null>(null);
   const undoManagerRef = useRef<Y.UndoManager | null>(null);
+  const providerRef = useRef<WebsocketProvider | null>(null);
 
   useEffect(() => {
     const ydoc = new Y.Doc();
@@ -63,9 +73,12 @@ export default function App() {
 
     // connect to websocket server
     const provider = new WebsocketProvider('ws://localhost:1234', 'sanctum-room-alpha', ydoc);
+    providerRef.current = provider;
 
     provider.awareness.on('change', () => {
-      setActiveUsers(provider.awareness.getStates().size);
+      const states = Array.from(provider.awareness.getStates().values()) as PeerState[];
+      setActiveUsers(states.length);
+      setPeerStates(states.filter((s) => s.hasVideo));
     });
 
     // sync map changes to local state
@@ -101,7 +114,7 @@ export default function App() {
     const ctx = customCtx || canvas.getContext('2d');
     if (!ctx) return;
 
-    ctx.fillStyle = '#0f172a';
+    ctx.fillStyle = bgColor;
     ctx.fillRect(0, 0, canvas.width, canvas.height);
 
     ctx.save();
@@ -155,11 +168,12 @@ export default function App() {
 
         if (editingId !== el.id) {
           ctx.fillStyle = '#0f172a';
-          ctx.font = 'bold 15px sans-serif';
+          const dynamicFontSize = Math.max(10, Math.min(w / 8, h / 5));
+          ctx.font = `bold ${dynamicFontSize}px sans-serif`;
 
           const words = (el.text || '').split(' ');
           let line = '';
-          let posY = el.y + 30;
+          let posY = el.y + dynamicFontSize + 10;
           const maxWidth = w - 24;
 
           for (let n = 0; n < words.length; n++) {
@@ -167,7 +181,7 @@ export default function App() {
             if (ctx.measureText(testLine).width > maxWidth && n > 0) {
               ctx.fillText(line, el.x + 12, posY);
               line = words[n] + ' ';
-              posY += 20;
+              posY += dynamicFontSize + 4;
             } else {
               line = testLine;
             }
@@ -190,6 +204,12 @@ export default function App() {
         ctx.lineWidth = isSelected ? 3 : 2;
         ctx.strokeStyle = isSelected ? '#38bdf8' : '#ffffff';
         ctx.stroke();
+
+        if (isSelected && !isExport) {
+          ctx.fillStyle = '#38bdf8';
+          const handleSize = 10 / viewport.scale;
+          ctx.fillRect(el.x + el.radius - handleSize / 2, el.y - handleSize / 2, handleSize, handleSize);
+        }
       } else if (el.type === 'rectangle' && el.x !== undefined && el.y !== undefined) {
         const w = el.width || 150;
         const h = el.height || 100;
@@ -230,7 +250,7 @@ export default function App() {
     return () => {
       window.removeEventListener('resize', handleResize);
     };
-  }, [viewport, elements, selectedId, editingId]);
+  }, [viewport, elements, selectedId, editingId, bgColor]);
 
   // convert screen center to active world coordinates
   const getCenterWorldPos = () => ({
@@ -306,6 +326,13 @@ export default function App() {
         if (el.x === undefined || el.y === undefined) continue;
         const dx = worldX - el.x;
         const dy = worldY - el.y;
+
+        const handleX = el.x + el.radius;
+        const handleY = el.y;
+        if (Math.abs(worldX - handleX) <= handleThreshold && Math.abs(worldY - handleY) <= handleThreshold) {
+          return { element: el, isResizeHandle: true };
+        }
+
         if (Math.sqrt(dx * dx + dy * dy) <= el.radius) {
           return { element: el, isResizeHandle: false };
         }
@@ -387,14 +414,22 @@ export default function App() {
       const existing = elementsMapRef.current?.get(selectedId);
       if (!existing) return;
 
-      if (isResizing && existing.x !== undefined && existing.y !== undefined) {
-        const newWidth = Math.max(60, worldX - existing.x);
-        const newHeight = Math.max(50, worldY - existing.y);
-        elementsMapRef.current?.set(selectedId, {
-          ...existing,
-          width: newWidth,
-          height: newHeight,
-        });
+      if (isResizing) {
+        if (existing.type === 'circle' && existing.x !== undefined) {
+          const newRadius = Math.max(10, Math.abs(worldX - existing.x));
+          elementsMapRef.current?.set(selectedId, {
+            ...existing,
+            radius: newRadius,
+          });
+        } else if (existing.x !== undefined && existing.y !== undefined) {
+          const newWidth = Math.max(40, worldX - existing.x);
+          const newHeight = Math.max(40, worldY - existing.y);
+          elementsMapRef.current?.set(selectedId, {
+            ...existing,
+            width: newWidth,
+            height: newHeight,
+          });
+        }
       } else if (!isResizing) {
         elementsMapRef.current?.set(selectedId, {
           ...existing,
@@ -423,15 +458,15 @@ export default function App() {
     }
   };
 
+  // uncapped infinite wheel zoom
   const handleWheel = (e: React.WheelEvent) => {
     e.preventDefault();
-    const zoomFactor = e.deltaY < 0 ? 1.1 : 0.9;
-    const newScale = Math.min(Math.max(0.1, viewport.scale * zoomFactor), 5);
-    setViewport((prev) => ({ ...prev, scale: newScale }));
+    const zoomFactor = e.deltaY < 0 ? 1.15 : 0.85;
+    setViewport((prev) => ({ ...prev, scale: Math.max(0.001, prev.scale * zoomFactor) }));
   };
 
-  const zoomIn = () => setViewport((prev) => ({ ...prev, scale: Math.min(5, prev.scale * 1.2) }));
-  const zoomOut = () => setViewport((prev) => ({ ...prev, scale: Math.max(0.1, prev.scale / 1.2) }));
+  const zoomIn = () => setViewport((prev) => ({ ...prev, scale: prev.scale * 1.25 }));
+  const zoomOut = () => setViewport((prev) => ({ ...prev, scale: Math.max(0.001, prev.scale / 1.25) }));
   const resetZoom = () => setViewport({ x: 0, y: 0, scale: 1 });
 
   const saveTextEdit = () => {
@@ -469,6 +504,8 @@ export default function App() {
         const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
         mediaStreamRef.current = stream;
         setIsVideoActive(true);
+        providerRef.current?.awareness.setLocalStateField('hasVideo', true);
+
         setTimeout(() => {
           if (localVideoRef.current) {
             localVideoRef.current.srcObject = stream;
@@ -486,6 +523,7 @@ export default function App() {
         localVideoRef.current.srcObject = null;
       }
       setIsVideoActive(false);
+      providerRef.current?.awareness.setLocalStateField('hasVideo', false);
     }
   };
 
@@ -498,10 +536,10 @@ export default function App() {
   } : null;
 
   return (
-    <div style={{ width: '100vw', height: '100vh', overflow: 'hidden', background: '#0f172a', position: 'relative', fontFamily: 'sans-serif' }}>
+    <div style={{ width: '100vw', height: '100vh', overflow: 'hidden', background: bgColor, position: 'relative', fontFamily: 'sans-serif' }}>
       
-      {/* top toolbar */}
-      <div style={{ position: 'absolute', top: 20, left: 20, zIndex: 10, display: 'flex', gap: '8px', alignItems: 'center', background: '#1e293b', padding: '10px 14px', borderRadius: '12px', border: '1px solid #334155', boxShadow: '0 10px 25px rgba(0,0,0,0.4)', flexWrap: 'wrap' }}>
+      {/* fixed top toolbar */}
+      <div style={{ position: 'fixed', top: 20, left: 20, zIndex: 1000, display: 'flex', gap: '8px', alignItems: 'center', background: '#1e293b', padding: '10px 14px', borderRadius: '12px', border: '1px solid #334155', boxShadow: '0 10px 25px rgba(0,0,0,0.4)', flexWrap: 'wrap' }}>
         <button onClick={() => setActiveTool('pan')} style={{ padding: '8px 12px', background: activeTool === 'pan' ? '#3b82f6' : '#334155', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold' }}>
           ✋ Pan
         </button>
@@ -525,8 +563,16 @@ export default function App() {
         </button>
 
         {activeTool === 'draw' && (
-          <input type="color" value={brushColor} onChange={(e) => setBrushColor(e.target.value)} style={{ width: '28px', height: '28px', border: 'none', cursor: 'pointer', background: 'none' }} />
+          <input type="color" value={brushColor} onChange={(e) => setBrushColor(e.target.value)} title="Brush Color" style={{ width: '28px', height: '28px', border: 'none', cursor: 'pointer', background: 'none' }} />
         )}
+
+        <div style={{ width: '1px', height: '24px', background: '#475569', margin: '0 2px' }} />
+
+        {/* background color picker */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+          <span style={{ color: '#94a3b8', fontSize: '12px', fontWeight: 'bold' }}>BG:</span>
+          <input type="color" value={bgColor} onChange={(e) => setBgColor(e.target.value)} title="Canvas Background Color" style={{ width: '28px', height: '28px', border: 'none', cursor: 'pointer', background: 'none' }} />
+        </div>
 
         <div style={{ width: '1px', height: '24px', background: '#475569', margin: '0 2px' }} />
 
@@ -551,21 +597,31 @@ export default function App() {
         </div>
       </div>
 
-      {/* bottom left zoom controls */}
-      <div style={{ position: 'absolute', bottom: 20, left: 20, zIndex: 10, display: 'flex', gap: '8px', background: '#1e293b', padding: '8px 12px', borderRadius: '10px', border: '1px solid #334155', boxShadow: '0 10px 25px rgba(0,0,0,0.4)', alignItems: 'center' }}>
+      {/* fixed bottom left zoom controls */}
+      <div style={{ position: 'fixed', bottom: 20, left: 20, zIndex: 1000, display: 'flex', gap: '8px', background: '#1e293b', padding: '8px 12px', borderRadius: '10px', border: '1px solid #334155', boxShadow: '0 10px 25px rgba(0,0,0,0.4)', alignItems: 'center' }}>
         <button onClick={zoomOut} style={{ padding: '6px 12px', background: '#334155', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold', fontSize: '16px' }}>－</button>
-        <span style={{ color: '#38bdf8', fontSize: '13px', fontWeight: 'bold', minWidth: '45px', textAlign: 'center' }}>{Math.round(viewport.scale * 100)}%</span>
+        <span style={{ color: '#38bdf8', fontSize: '13px', fontWeight: 'bold', minWidth: '55px', textAlign: 'center' }}>{Math.round(viewport.scale * 100)}%</span>
         <button onClick={zoomIn} style={{ padding: '6px 12px', background: '#334155', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold', fontSize: '16px' }}>＋</button>
         <button onClick={resetZoom} style={{ padding: '6px 10px', background: '#475569', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold', fontSize: '12px' }}>Reset</button>
       </div>
 
-      {/* camera preview box */}
-      {isVideoActive && (
-        <div style={{ position: 'absolute', bottom: 20, right: 20, zIndex: 10, background: '#1e293b', padding: '8px', borderRadius: '12px', border: '2px solid #8b5cf6', boxShadow: '0 10px 25px rgba(0,0,0,0.5)' }}>
-          <video ref={localVideoRef} autoPlay playsInline muted style={{ width: '200px', height: '140px', borderRadius: '8px', objectFit: 'cover', transform: 'scaleX(-1)', display: 'block' }} />
-          <div style={{ color: '#fff', fontSize: '11px', textAlign: 'center', marginTop: '4px', fontWeight: 'bold' }}>Camera Active</div>
-        </div>
-      )}
+      {/* collaborative camera preview grid */}
+      <div style={{ position: 'fixed', bottom: 20, right: 20, zIndex: 1000, display: 'flex', gap: '10px', flexWrap: 'wrap', maxWidth: '440px', justifyContent: 'flex-end' }}>
+        {isVideoActive && (
+          <div style={{ background: '#1e293b', padding: '6px', borderRadius: '12px', border: '2px solid #8b5cf6', boxShadow: '0 10px 25px rgba(0,0,0,0.5)' }}>
+            <video ref={localVideoRef} autoPlay playsInline muted style={{ width: '180px', height: '120px', borderRadius: '8px', objectFit: 'cover', transform: 'scaleX(-1)', display: 'block' }} />
+            <div style={{ color: '#fff', fontSize: '11px', textAlign: 'center', marginTop: '4px', fontWeight: 'bold' }}>You (Local)</div>
+          </div>
+        )}
+        {peerStates.filter(() => isVideoActive).map((_, idx) => (
+          <div key={idx} style={{ background: '#1e293b', padding: '6px', borderRadius: '12px', border: '2px solid #10b981', boxShadow: '0 10px 25px rgba(0,0,0,0.5)' }}>
+            <div style={{ width: '180px', height: '120px', borderRadius: '8px', background: '#0f172a', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#10b981', fontWeight: 'bold', fontSize: '13px' }}>
+              📹 Peer Stream #{idx + 1}
+            </div>
+            <div style={{ color: '#fff', fontSize: '11px', textAlign: 'center', marginTop: '4px', fontWeight: 'bold' }}>Collaborator #{idx + 1}</div>
+          </div>
+        ))}
+      </div>
 
       {/* inline textarea overlay for editing sticky note text */}
       {editingId && editingScreenBounds && (
@@ -581,19 +637,19 @@ export default function App() {
             }
           }}
           style={{
-            position: 'absolute',
+            position: 'fixed',
             left: `${editingScreenBounds.left}px`,
             top: `${editingScreenBounds.top}px`,
             width: `${editingScreenBounds.width}px`,
             height: `${editingScreenBounds.height}px`,
-            fontSize: `${Math.max(12, 15 * viewport.scale)}px`,
+            fontSize: `${Math.max(10, Math.min(editingScreenBounds.width / 8, editingScreenBounds.height / 5))}px`,
             fontFamily: 'sans-serif',
             color: '#0f172a',
             background: 'transparent',
             border: '1px dashed #0f172a',
             outline: 'none',
             resize: 'none',
-            zIndex: 20,
+            zIndex: 1001,
           }}
         />
       )}
