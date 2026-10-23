@@ -2,10 +2,9 @@ import React, { useEffect, useRef, useState } from 'react';
 import * as Y from 'yjs';
 import { WebsocketProvider } from 'y-websocket';
 
-// canvas element type definition
 interface CanvasElement {
   id: string;
-  type: 'sticky' | 'path' | 'circle' | 'rectangle';
+  type: 'sticky' | 'path' | 'circle' | 'rectangle' | 'rounded' | 'diamond';
   x?: number;
   y?: number;
   width?: number;
@@ -18,35 +17,28 @@ interface CanvasElement {
 
 interface PeerState {
   hasVideo?: boolean;
-  peerId?: string;
 }
 
 export default function App() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
-  // pan & zoom state
   const [viewport, setViewport] = useState({ x: 0, y: 0, scale: 1 });
   const [isInteracting, setIsInteracting] = useState(false);
   const [startPan, setStartPan] = useState({ x: 0, y: 0 });
 
-  // canvas background color state
   const [bgColor, setBgColor] = useState('#0f172a');
-
-  // active tool mode & brush settings
   const [activeTool, setActiveTool] = useState<'pan' | 'select' | 'draw'>('select');
   const [brushColor, setBrushColor] = useState('#38bdf8');
+  const [shapeFillColor, setShapeFillColor] = useState('#fef08a');
   const [currentPath, setCurrentPath] = useState<{ x: number; y: number }[]>([]);
 
-  // selection & dragging state
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [isResizing, setIsResizing] = useState(false);
   const [dragOffset, setDragOffset] = useState({ x: 0, y: 0 });
 
-  // inline sticky note editing state
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editText, setEditText] = useState('');
 
-  // camera stream state
   const localVideoRef = useRef<HTMLVideoElement | null>(null);
   const [isVideoActive, setIsVideoActive] = useState(false);
   const mediaStreamRef = useRef<MediaStream | null>(null);
@@ -55,7 +47,6 @@ export default function App() {
   const [elements, setElements] = useState<CanvasElement[]>([]);
   const [activeUsers, setActiveUsers] = useState<number>(1);
 
-  // yjs persistence refs
   const ydocRef = useRef<Y.Doc | null>(null);
   const elementsMapRef = useRef<Y.Map<CanvasElement> | null>(null);
   const undoManagerRef = useRef<Y.UndoManager | null>(null);
@@ -71,7 +62,6 @@ export default function App() {
     const undoManager = new Y.UndoManager(elementsMap);
     undoManagerRef.current = undoManager;
 
-    // connect to websocket server
     const provider = new WebsocketProvider('ws://localhost:1234', 'sanctum-room-alpha', ydoc);
     providerRef.current = provider;
 
@@ -81,12 +71,10 @@ export default function App() {
       setPeerStates(states.filter((s) => s.hasVideo));
     });
 
-    // sync map changes to local state
     elementsMap.observe(() => {
       setElements(Array.from(elementsMap.values()));
     });
 
-    // keyboard shortcuts for undo / redo
     const handleKeyDown = (e: KeyboardEvent) => {
       const isCmdOrCtrl = e.metaKey || e.ctrlKey;
       if (isCmdOrCtrl && e.key === 'z' && !e.shiftKey) {
@@ -107,7 +95,6 @@ export default function App() {
     };
   }, []);
 
-  // high performance canvas render loop
   const renderCanvas = (customCtx?: CanvasRenderingContext2D, isExport = false) => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -125,32 +112,12 @@ export default function App() {
     ctx.translate(viewport.x, viewport.y);
     ctx.scale(viewport.scale, viewport.scale);
 
-    // draw grid
-    ctx.strokeStyle = '#1e293b';
-    ctx.lineWidth = 1 / viewport.scale;
-    const gridSize = 50;
-    const extent = 10000;
-
-    for (let x = -extent; x < extent; x += gridSize) {
-      ctx.beginPath();
-      ctx.moveTo(x, -extent);
-      ctx.lineTo(x, extent);
-      ctx.stroke();
-    }
-    for (let y = -extent; y < extent; y += gridSize) {
-      ctx.beginPath();
-      ctx.moveTo(-extent, y);
-      ctx.lineTo(extent, y);
-      ctx.stroke();
-    }
-
-    // render shapes, paths, and selection frames
     elements.forEach((el) => {
       const isSelected = el.id === selectedId;
 
       if (el.type === 'sticky' && el.x !== undefined && el.y !== undefined) {
-        const w = el.width || 180;
-        const h = el.height || 140;
+        const w = el.width || 200;
+        const h = el.height || 160;
 
         ctx.fillStyle = el.color;
         ctx.fillRect(el.x, el.y, w, h);
@@ -160,7 +127,6 @@ export default function App() {
           ctx.lineWidth = 2 / viewport.scale;
           ctx.strokeRect(el.x - 2, el.y - 2, w + 4, h + 4);
 
-          // resize handle
           ctx.fillStyle = '#38bdf8';
           const handleSize = 10 / viewport.scale;
           ctx.fillRect(el.x + w - handleSize / 2, el.y + h - handleSize / 2, handleSize, handleSize);
@@ -168,12 +134,12 @@ export default function App() {
 
         if (editingId !== el.id) {
           ctx.fillStyle = '#0f172a';
-          const dynamicFontSize = Math.max(10, Math.min(w / 8, h / 5));
-          ctx.font = `bold ${dynamicFontSize}px sans-serif`;
+          ctx.font = '16px sans-serif';
 
-          const words = (el.text || '').split(' ');
+          const textContent = el.text || '';
+          const words = textContent.split(' ');
           let line = '';
-          let posY = el.y + dynamicFontSize + 10;
+          let posY = el.y + 30;
           const maxWidth = w - 24;
 
           for (let n = 0; n < words.length; n++) {
@@ -181,7 +147,7 @@ export default function App() {
             if (ctx.measureText(testLine).width > maxWidth && n > 0) {
               ctx.fillText(line, el.x + 12, posY);
               line = words[n] + ' ';
-              posY += dynamicFontSize + 4;
+              posY += 22;
             } else {
               line = testLine;
             }
@@ -211,13 +177,50 @@ export default function App() {
           ctx.fillRect(el.x + el.radius - handleSize / 2, el.y - handleSize / 2, handleSize, handleSize);
         }
       } else if (el.type === 'rectangle' && el.x !== undefined && el.y !== undefined) {
-        const w = el.width || 150;
+        const w = el.width || 160;
         const h = el.height || 100;
         ctx.fillStyle = el.color;
         ctx.fillRect(el.x, el.y, w, h);
         ctx.lineWidth = isSelected ? 3 : 2;
         ctx.strokeStyle = isSelected ? '#38bdf8' : '#ffffff';
         ctx.strokeRect(el.x, el.y, w, h);
+
+        if (isSelected && !isExport) {
+          ctx.fillStyle = '#38bdf8';
+          const handleSize = 10 / viewport.scale;
+          ctx.fillRect(el.x + w - handleSize / 2, el.y + h - handleSize / 2, handleSize, handleSize);
+        }
+      } else if (el.type === 'rounded' && el.x !== undefined && el.y !== undefined) {
+        const w = el.width || 160;
+        const h = el.height || 100;
+        const radius = 16;
+        ctx.beginPath();
+        ctx.roundRect(el.x, el.y, w, h, radius);
+        ctx.fillStyle = el.color;
+        ctx.fill();
+        ctx.lineWidth = isSelected ? 3 : 2;
+        ctx.strokeStyle = isSelected ? '#38bdf8' : '#ffffff';
+        ctx.stroke();
+
+        if (isSelected && !isExport) {
+          ctx.fillStyle = '#38bdf8';
+          const handleSize = 10 / viewport.scale;
+          ctx.fillRect(el.x + w - handleSize / 2, el.y + h - handleSize / 2, handleSize, handleSize);
+        }
+      } else if (el.type === 'diamond' && el.x !== undefined && el.y !== undefined) {
+        const w = el.width || 160;
+        const h = el.height || 100;
+        ctx.beginPath();
+        ctx.moveTo(el.x + w / 2, el.y);
+        ctx.lineTo(el.x + w, el.y + h / 2);
+        ctx.lineTo(el.x + w / 2, el.y + h);
+        ctx.lineTo(el.x, el.y + h / 2);
+        ctx.closePath();
+        ctx.fillStyle = el.color;
+        ctx.fill();
+        ctx.lineWidth = isSelected ? 3 : 2;
+        ctx.strokeStyle = isSelected ? '#38bdf8' : '#ffffff';
+        ctx.stroke();
 
         if (isSelected && !isExport) {
           ctx.fillStyle = '#38bdf8';
@@ -252,65 +255,38 @@ export default function App() {
     };
   }, [viewport, elements, selectedId, editingId, bgColor]);
 
-  // convert screen center to active world coordinates
   const getCenterWorldPos = () => ({
     x: (window.innerWidth / 2 - viewport.x) / viewport.scale,
     y: (window.innerHeight / 2 - viewport.y) / viewport.scale,
   });
 
-  const addStickyNote = () => {
+  const addShape = (type: 'sticky' | 'circle' | 'rectangle' | 'rounded' | 'diamond') => {
     const id = Math.random().toString(36).substring(2, 9);
     const pos = getCenterWorldPos();
-    const noteColors = ['#fef08a', '#bbf7d0', '#bfdbfe', '#fbcfe8'];
+    const defaultW = Math.max(180, window.innerWidth * 0.15 / viewport.scale);
+    const defaultH = Math.max(140, window.innerHeight * 0.15 / viewport.scale);
 
     elementsMapRef.current?.set(id, {
       id,
-      type: 'sticky',
-      x: pos.x - 90,
-      y: pos.y - 70,
-      width: 180,
-      height: 140,
-      text: 'Double click to edit',
-      color: noteColors[Math.floor(Math.random() * noteColors.length)],
+      type,
+      x: pos.x - defaultW / 2,
+      y: pos.y - defaultH / 2,
+      width: defaultW,
+      height: defaultH,
+      radius: type === 'circle' ? defaultW / 3 : undefined,
+      text: type === 'sticky' ? 'Double click to edit' : undefined,
+      color: shapeFillColor,
     });
   };
 
-  const addCircle = () => {
-    const id = Math.random().toString(36).substring(2, 9);
-    const pos = getCenterWorldPos();
-    elementsMapRef.current?.set(id, {
-      id,
-      type: 'circle',
-      x: pos.x,
-      y: pos.y,
-      radius: 50,
-      color: '#ec4899',
-    });
-  };
-
-  const addRectangle = () => {
-    const id = Math.random().toString(36).substring(2, 9);
-    const pos = getCenterWorldPos();
-    elementsMapRef.current?.set(id, {
-      id,
-      type: 'rectangle',
-      x: pos.x - 75,
-      y: pos.y - 50,
-      width: 150,
-      height: 100,
-      color: '#8b5cf6',
-    });
-  };
-
-  // test if world click hits an element or its resize handle
   const getElementHitInfo = (worldX: number, worldY: number) => {
-    const handleThreshold = 12 / viewport.scale;
+    const handleThreshold = 14 / viewport.scale;
 
     for (let i = elements.length - 1; i >= 0; i--) {
       const el = elements[i];
-      if (el.type === 'sticky' || el.type === 'rectangle') {
-        const w = el.width || (el.type === 'sticky' ? 180 : 150);
-        const h = el.height || (el.type === 'sticky' ? 140 : 100);
+      if (el.type === 'sticky' || el.type === 'rectangle' || el.type === 'rounded' || el.type === 'diamond') {
+        const w = el.width || 160;
+        const h = el.height || 100;
         if (el.x === undefined || el.y === undefined) continue;
 
         const handleX = el.x + w;
@@ -458,15 +434,14 @@ export default function App() {
     }
   };
 
-  // uncapped infinite wheel zoom
   const handleWheel = (e: React.WheelEvent) => {
     e.preventDefault();
     const zoomFactor = e.deltaY < 0 ? 1.15 : 0.85;
-    setViewport((prev) => ({ ...prev, scale: Math.max(0.001, prev.scale * zoomFactor) }));
+    setViewport((prev) => ({ ...prev, scale: prev.scale * zoomFactor }));
   };
 
   const zoomIn = () => setViewport((prev) => ({ ...prev, scale: prev.scale * 1.25 }));
-  const zoomOut = () => setViewport((prev) => ({ ...prev, scale: Math.max(0.001, prev.scale / 1.25) }));
+  const zoomOut = () => setViewport((prev) => ({ ...prev, scale: prev.scale / 1.25 }));
   const resetZoom = () => setViewport({ x: 0, y: 0, scale: 1 });
 
   const saveTextEdit = () => {
@@ -531,15 +506,15 @@ export default function App() {
   const editingScreenBounds = activeEditingElement && activeEditingElement.x !== undefined && activeEditingElement.y !== undefined ? {
     left: activeEditingElement.x * viewport.scale + viewport.x + 12,
     top: activeEditingElement.y * viewport.scale + viewport.y + 12,
-    width: (activeEditingElement.width || 180) * viewport.scale - 24,
-    height: (activeEditingElement.height || 140) * viewport.scale - 24,
+    width: (activeEditingElement.width || 200) * viewport.scale - 24,
+    height: (activeEditingElement.height || 160) * viewport.scale - 24,
   } : null;
 
   return (
     <div style={{ width: '100vw', height: '100vh', overflow: 'hidden', background: bgColor, position: 'relative', fontFamily: 'sans-serif' }}>
       
-      {/* fixed top toolbar */}
-      <div style={{ position: 'fixed', top: 20, left: 20, zIndex: 1000, display: 'flex', gap: '8px', alignItems: 'center', background: '#1e293b', padding: '10px 14px', borderRadius: '12px', border: '1px solid #334155', boxShadow: '0 10px 25px rgba(0,0,0,0.4)', flexWrap: 'wrap' }}>
+      {/* toolbar */}
+      <div style={{ position: 'fixed', top: 20, left: 20, zIndex: 9999, pointerEvents: 'auto', display: 'flex', gap: '8px', alignItems: 'center', background: '#1e293b', padding: '10px 14px', borderRadius: '12px', border: '1px solid #334155', boxShadow: '0 10px 25px rgba(0,0,0,0.4)', flexWrap: 'wrap' }}>
         <button onClick={() => setActiveTool('pan')} style={{ padding: '8px 12px', background: activeTool === 'pan' ? '#3b82f6' : '#334155', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold' }}>
           ✋ Pan
         </button>
@@ -552,15 +527,23 @@ export default function App() {
 
         <div style={{ width: '1px', height: '24px', background: '#475569', margin: '0 2px' }} />
 
-        <button onClick={addStickyNote} style={{ padding: '8px 10px', background: '#10b981', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold' }}>
+        <button onClick={() => addShape('sticky')} style={{ padding: '8px 10px', background: '#10b981', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold' }}>
           + Sticky
         </button>
-        <button onClick={addCircle} style={{ padding: '8px 10px', background: '#ec4899', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold' }}>
+        <button onClick={() => addShape('circle')} style={{ padding: '8px 10px', background: '#ec4899', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold' }}>
           ⭕ Circle
         </button>
-        <button onClick={addRectangle} style={{ padding: '8px 10px', background: '#8b5cf6', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold' }}>
+        <button onClick={() => addShape('rectangle')} style={{ padding: '8px 10px', background: '#8b5cf6', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold' }}>
           🟦 Rect
         </button>
+        <button onClick={() => addShape('rounded')} style={{ padding: '8px 10px', background: '#f59e0b', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold' }}>
+          🔲 Rounded
+        </button>
+        <button onClick={() => addShape('diamond')} style={{ padding: '8px 10px', background: '#06b6d4', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold' }}>
+          🔶 Diamond
+        </button>
+
+        <input type="color" value={shapeFillColor} onChange={(e) => setShapeFillColor(e.target.value)} title="Shape Fill Color" style={{ width: '28px', height: '28px', border: 'none', cursor: 'pointer', background: 'none' }} />
 
         {activeTool === 'draw' && (
           <input type="color" value={brushColor} onChange={(e) => setBrushColor(e.target.value)} title="Brush Color" style={{ width: '28px', height: '28px', border: 'none', cursor: 'pointer', background: 'none' }} />
@@ -568,11 +551,7 @@ export default function App() {
 
         <div style={{ width: '1px', height: '24px', background: '#475569', margin: '0 2px' }} />
 
-        {/* background color picker */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-          <span style={{ color: '#94a3b8', fontSize: '12px', fontWeight: 'bold' }}>BG:</span>
-          <input type="color" value={bgColor} onChange={(e) => setBgColor(e.target.value)} title="Canvas Background Color" style={{ width: '28px', height: '28px', border: 'none', cursor: 'pointer', background: 'none' }} />
-        </div>
+        <input type="color" value={bgColor} onChange={(e) => setBgColor(e.target.value)} title="Canvas Background Color" style={{ width: '28px', height: '28px', border: 'none', cursor: 'pointer', background: 'none' }} />
 
         <div style={{ width: '1px', height: '24px', background: '#475569', margin: '0 2px' }} />
 
@@ -597,16 +576,16 @@ export default function App() {
         </div>
       </div>
 
-      {/* fixed bottom left zoom controls */}
-      <div style={{ position: 'fixed', bottom: 20, left: 20, zIndex: 1000, display: 'flex', gap: '8px', background: '#1e293b', padding: '8px 12px', borderRadius: '10px', border: '1px solid #334155', boxShadow: '0 10px 25px rgba(0,0,0,0.4)', alignItems: 'center' }}>
+      {/* zoom controls */}
+      <div style={{ position: 'fixed', bottom: 20, left: 20, zIndex: 9999, pointerEvents: 'auto', display: 'flex', gap: '8px', background: '#1e293b', padding: '8px 12px', borderRadius: '10px', border: '1px solid #334155', boxShadow: '0 10px 25px rgba(0,0,0,0.4)', alignItems: 'center' }}>
         <button onClick={zoomOut} style={{ padding: '6px 12px', background: '#334155', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold', fontSize: '16px' }}>－</button>
         <span style={{ color: '#38bdf8', fontSize: '13px', fontWeight: 'bold', minWidth: '55px', textAlign: 'center' }}>{Math.round(viewport.scale * 100)}%</span>
         <button onClick={zoomIn} style={{ padding: '6px 12px', background: '#334155', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold', fontSize: '16px' }}>＋</button>
         <button onClick={resetZoom} style={{ padding: '6px 10px', background: '#475569', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold', fontSize: '12px' }}>Reset</button>
       </div>
 
-      {/* collaborative camera preview grid */}
-      <div style={{ position: 'fixed', bottom: 20, right: 20, zIndex: 1000, display: 'flex', gap: '10px', flexWrap: 'wrap', maxWidth: '440px', justifyContent: 'flex-end' }}>
+      {/* camera preview grid */}
+      <div style={{ position: 'fixed', bottom: 20, right: 20, zIndex: 9999, pointerEvents: 'auto', display: 'flex', gap: '10px', flexWrap: 'wrap', maxWidth: '440px', justifyContent: 'flex-end' }}>
         {isVideoActive && (
           <div style={{ background: '#1e293b', padding: '6px', borderRadius: '12px', border: '2px solid #8b5cf6', boxShadow: '0 10px 25px rgba(0,0,0,0.5)' }}>
             <video ref={localVideoRef} autoPlay playsInline muted style={{ width: '180px', height: '120px', borderRadius: '8px', objectFit: 'cover', transform: 'scaleX(-1)', display: 'block' }} />
@@ -623,7 +602,7 @@ export default function App() {
         ))}
       </div>
 
-      {/* inline textarea overlay for editing sticky note text */}
+      {/* inline textarea overlay */}
       {editingId && editingScreenBounds && (
         <textarea
           autoFocus
@@ -642,14 +621,14 @@ export default function App() {
             top: `${editingScreenBounds.top}px`,
             width: `${editingScreenBounds.width}px`,
             height: `${editingScreenBounds.height}px`,
-            fontSize: `${Math.max(10, Math.min(editingScreenBounds.width / 8, editingScreenBounds.height / 5))}px`,
+            fontSize: '16px',
             fontFamily: 'sans-serif',
             color: '#0f172a',
             background: 'transparent',
             border: '1px dashed #0f172a',
             outline: 'none',
             resize: 'none',
-            zIndex: 1001,
+            zIndex: 10000,
           }}
         />
       )}
