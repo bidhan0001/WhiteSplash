@@ -1,648 +1,746 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
-import './App.css';
+import React, { useEffect, useRef, useState } from 'react';
+import * as Y from 'yjs';
+import { WebsocketProvider } from 'y-websocket';
 
-// Types & Interfaces
-export type ToolType = 'select' | 'pan' | 'pen' | 'rectangle' | 'circle' | 'sticky' | 'eraser';
-
-export interface CanvasElement {
+interface CanvasElement {
   id: string;
-  type: ToolType;
-  x: number;
-  y: number;
+  type: 'sticky' | 'path' | 'circle' | 'rectangle' | 'rounded' | 'diamond';
+  x?: number;
+  y?: number;
   width?: number;
   height?: number;
   radius?: number;
-  strokeColor: string;
-  fillColor?: string;
-  lineWidth: number;
-  points?: { x: number; y: number }[];
-  text?: string;
-}
-
-export interface PeerUser {
-  id: string;
-  name: string;
   color: string;
-  x: number;
-  y: number;
+  text?: string;
+  points?: { x: number; y: number }[];
 }
 
-export const App: React.FC = () => {
-  // Tool & Canvas State
-  const [activeTool, setActiveTool] = useState<ToolType>('pen');
-  const [strokeColor, setStrokeColor] = useState<string>('#38bdf8');
-  const [lineWidth, setLineWidth] = useState<number>(4);
-  const [stickyText, setStickyText] = useState<string>('Cosmic Idea ✨');
+interface PeerState {
+  hasVideo?: boolean;
+}
 
-  // Canvas Viewport State (Pan & Zoom)
-  const [panOffset, setPanOffset] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
-  const [zoomScale, setZoomScale] = useState<number>(1);
-  const [isPanning, setIsPanning] = useState<boolean>(false);
-  const [startPan, setStartPan] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
+export default function App() {
+  const [currentUser, setCurrentUser] = useState<string | null>(null);
+  const [usernameInput, setUsernameInput] = useState('');
+  const [passwordInput, setPasswordInput] = useState('');
 
-  // History & Elements
-  const [elements, setElements] = useState<CanvasElement[]>([]);
-  const [history, setHistory] = useState<CanvasElement[][]>([]);
-  const [historyIndex, setHistoryIndex] = useState<number>(-1);
-  const [isDrawing, setIsDrawing] = useState<boolean>(false);
-  const [currentElement, setCurrentElement] = useState<CanvasElement | null>(null);
-  const [selectedElementId, setSelectedElementId] = useState<string | null>(null);
-
-  // Camera & Collaboration State
-  const [isVideoOn, setIsVideoOn] = useState<boolean>(false);
-  const [peers, setPeers] = useState<PeerUser[]>([
-    { id: '1', name: 'Astra', color: '#ec4899', x: 200, y: 150 },
-    { id: '2', name: 'Orion', color: '#10b981', x: 450, y: 300 }
-  ]);
-
-  // Refs
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const videoRef = useRef<HTMLVideoElement | null>(null);
+
+  const [viewport, setViewport] = useState({ x: 0, y: 0, scale: 1 });
+  const [isInteracting, setIsInteracting] = useState(false);
+  const [startPan, setStartPan] = useState({ x: 0, y: 0 });
+
+  const [bgColor, setBgColor] = useState('#0f172a');
+  const [activeTool, setActiveTool] = useState<'pan' | 'select' | 'draw'>('select');
+  const [brushColor, setBrushColor] = useState('#38bdf8');
+  const [shapeFillColor, setShapeFillColor] = useState('#fef08a');
+  const [currentPath, setCurrentPath] = useState<{ x: number; y: number }[]>([]);
+
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [isResizing, setIsResizing] = useState(false);
+  const [dragOffset, setDragOffset] = useState({ x: 0, y: 0 });
+
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editText, setEditText] = useState('');
+
+  const localVideoRef = useRef<HTMLVideoElement | null>(null);
+  const [isVideoActive, setIsVideoActive] = useState(false);
   const mediaStreamRef = useRef<MediaStream | null>(null);
-  const containerRef = useRef<HTMLDivElement | null>(null);
+  const [peerStates, setPeerStates] = useState<PeerState[]>([]);
 
-  // Save history state helper
-  const saveToHistory = useCallback((newElements: CanvasElement[]) => {
-    const updatedHistory = history.slice(0, historyIndex + 1);
-    setHistory([...updatedHistory, newElements]);
-    setHistoryIndex(updatedHistory.length);
-    setElements(newElements);
-  }, [history, historyIndex]);
+  const [elements, setElements] = useState<CanvasElement[]>([]);
+  const [activeUsers, setActiveUsers] = useState<number>(1);
 
-  // Initial State History Setup
+  const ydocRef = useRef<Y.Doc | null>(null);
+  const elementsMapRef = useRef<Y.Map<CanvasElement> | null>(null);
+  const undoManagerRef = useRef<Y.UndoManager | null>(null);
+  const providerRef = useRef<WebsocketProvider | null>(null);
+
   useEffect(() => {
-    if (history.length === 0) {
-      setHistory([[]]);
-      setHistoryIndex(0);
-    }
-  }, [history.length]);
+    if (!currentUser) return;
 
-  // Handle Camera Toggle
-  const toggleCamera = async () => {
-    if (isVideoOn) {
-      if (mediaStreamRef.current) {
-        mediaStreamRef.current.getTracks().forEach((track) => track.stop());
-        mediaStreamRef.current = null;
+    const ydoc = new Y.Doc();
+    ydocRef.current = ydoc;
+
+    const elementsMap = ydoc.getMap<CanvasElement>('whitesplash-elements');
+    elementsMapRef.current = elementsMap;
+
+    const undoManager = new Y.UndoManager(elementsMap);
+    undoManagerRef.current = undoManager;
+
+    const provider = new WebsocketProvider('ws://localhost:1234', 'whitesplash-room-alpha', ydoc);
+    providerRef.current = provider;
+
+    provider.awareness.setLocalStateField('user', currentUser);
+
+    provider.awareness.on('change', () => {
+      const states = Array.from(provider.awareness.getStates().values()) as PeerState[];
+      setActiveUsers(states.length);
+      setPeerStates(states.filter((s) => s.hasVideo));
+    });
+
+    elementsMap.observe(() => {
+      setElements(Array.from(elementsMap.values()));
+    });
+
+    const handleKeyDown = (e: KeyboardEvent) => {
+      const isCmdOrCtrl = e.metaKey || e.ctrlKey;
+      if (isCmdOrCtrl && e.key === 'z' && !e.shiftKey) {
+        e.preventDefault();
+        undoManagerRef.current?.undo();
+      } else if (isCmdOrCtrl && (e.key === 'y' || (e.key === 'z' && e.shiftKey))) {
+        e.preventDefault();
+        undoManagerRef.current?.redo();
       }
-      setIsVideoOn(false);
-    } else {
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
-        mediaStreamRef.current = stream;
-        if (videoRef.current) {
-          videoRef.current.srcObject = stream;
-        }
-        setIsVideoOn(true);
-      } catch (err) {
-        alert('Could not access camera device.');
-      }
-    }
-  };
-
-  // Simulate Peer Cursor Movements
-  useEffect(() => {
-    const interval = setInterval(() => {
-      setPeers((prevPeers) =>
-        prevPeers.map((peer) => ({
-          ...peer,
-          x: Math.max(100, Math.min(window.innerWidth - 100, peer.x + (Math.random() - 0.5) * 40)),
-          y: Math.max(100, Math.min(window.innerHeight - 100, peer.y + (Math.random() - 0.5) * 40))
-        }))
-      );
-    }, 2000);
-    return () => clearInterval(interval);
-  }, []);
-
-  // Screen-to-Canvas Coordinate Conversion
-  const getCanvasCoordinates = (e: React.MouseEvent<HTMLCanvasElement>): { x: number; y: number } => {
-    const canvas = canvasRef.current;
-    if (!canvas) return { x: 0, y: 0 };
-    const rect = canvas.getBoundingClientRect();
-    const rawX = e.clientX - rect.left;
-    const rawY = e.clientY - rect.top;
-    return {
-      x: (rawX - panOffset.x) / zoomScale,
-      y: (rawY - panOffset.y) / zoomScale
     };
-  };
 
-  // Draw Background Starry Galaxy & Aurora Theme
-  const drawCosmicBackground = (ctx: CanvasRenderingContext2D, width: number, height: number) => {
-    const spaceGradient = ctx.createLinearGradient(0, 0, width, height);
-    spaceGradient.addColorStop(0, '#030712');
-    spaceGradient.addColorStop(0.4, '#0b0f29');
-    spaceGradient.addColorStop(0.8, '#0f172a');
-    spaceGradient.addColorStop(1, '#1e1b4b');
-    ctx.fillStyle = spaceGradient;
-    ctx.fillRect(0, 0, width, height);
+    window.addEventListener('keydown', handleKeyDown);
 
-    const aurora1 = ctx.createRadialGradient(width * 0.3, height * 0.2, 50, width * 0.3, height * 0.2, width * 0.6);
-    aurora1.addColorStop(0, 'rgba(16, 185, 129, 0.15)');
-    aurora1.addColorStop(0.5, 'rgba(6, 182, 212, 0.08)');
-    aurora1.addColorStop(1, 'transparent');
-    ctx.fillStyle = aurora1;
-    ctx.fillRect(0, 0, width, height);
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+      provider.destroy();
+      ydoc.destroy();
+    };
+  }, [currentUser]);
 
-    const aurora2 = ctx.createRadialGradient(width * 0.7, height * 0.7, 50, width * 0.7, height * 0.7, width * 0.5);
-    aurora2.addColorStop(0, 'rgba(168, 85, 247, 0.18)');
-    aurora2.addColorStop(0.5, 'rgba(236, 72, 153, 0.08)');
-    aurora2.addColorStop(1, 'transparent');
-    ctx.fillStyle = aurora2;
-    ctx.fillRect(0, 0, width, height);
-
-    ctx.strokeStyle = 'rgba(255, 255, 255, 0.03)';
-    ctx.lineWidth = 1;
-    const gridSize = 60 * zoomScale;
-    const startX = panOffset.x % gridSize;
-    const startY = panOffset.y % gridSize;
-
-    for (let x = startX; x < width; x += gridSize) {
-      ctx.beginPath();
-      ctx.moveTo(x, 0);
-      ctx.lineTo(x, height);
-      ctx.stroke();
-    }
-    for (let y = startY; y < height; y += gridSize) {
-      ctx.beginPath();
-      ctx.moveTo(0, y);
-      ctx.lineTo(width, y);
-      ctx.stroke();
-    }
-  };
-
-  // Render Elements Loop
-  const renderCanvas = useCallback(() => {
+  const renderCanvas = (customCtx?: CanvasRenderingContext2D, isExport = false) => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-    const ctx = canvas.getContext('2d');
+    const ctx = customCtx || canvas.getContext('2d');
     if (!ctx) return;
 
-    if (canvas.width !== window.innerWidth || canvas.height !== window.innerHeight) {
-      canvas.width = window.innerWidth;
-      canvas.height = window.innerHeight;
-    }
-
-    drawCosmicBackground(ctx, canvas.width, canvas.height);
+    ctx.fillStyle = bgColor;
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
 
     ctx.save();
-    ctx.translate(panOffset.x, panOffset.y);
-    ctx.scale(zoomScale, zoomScale);
+    if (!isExport) {
+      const dpr = window.devicePixelRatio || 1;
+      ctx.scale(dpr, dpr);
+    }
+    ctx.translate(viewport.x, viewport.y);
+    ctx.scale(viewport.scale, viewport.scale);
 
-    const allElements = currentElement ? [...elements, currentElement] : elements;
+    elements.forEach((el) => {
+      const isSelected = el.id === selectedId;
 
-    allElements.forEach((el) => {
-      ctx.beginPath();
-      ctx.strokeStyle = el.strokeColor;
-      ctx.lineWidth = el.lineWidth;
-      ctx.lineCap = 'round';
-      ctx.lineJoin = 'round';
+      if (el.type === 'sticky' && el.x !== undefined && el.y !== undefined) {
+        const w = el.width || 200;
+        const h = el.height || 160;
 
-      ctx.shadowColor = el.strokeColor;
-      ctx.shadowBlur = el.type === 'pen' ? 8 : 0;
+        ctx.fillStyle = el.color;
+        ctx.fillRect(el.x, el.y, w, h);
 
-      if (el.type === 'pen' && el.points && el.points.length > 0) {
-        ctx.moveTo(el.points[0].x, el.points[0].y);
-        for (let i = 1; i < el.points.length; i++) {
-          ctx.lineTo(el.points[i].x, el.points[i].y);
+        if (isSelected && !isExport) {
+          ctx.strokeStyle = '#38bdf8';
+          ctx.lineWidth = 2 / viewport.scale;
+          ctx.strokeRect(el.x - 2, el.y - 2, w + 4, h + 4);
+
+          ctx.fillStyle = '#38bdf8';
+          const handleSize = 10 / viewport.scale;
+          ctx.fillRect(el.x + w - handleSize / 2, el.y + h - handleSize / 2, handleSize, handleSize);
         }
-        ctx.stroke();
-      } else if (el.type === 'rectangle' && el.width !== undefined && el.height !== undefined) {
-        if (el.fillColor) {
-          ctx.fillStyle = el.fillColor;
-          ctx.fillRect(el.x, el.y, el.width, el.height);
-        }
-        ctx.strokeRect(el.x, el.y, el.width, el.height);
-      } else if (el.type === 'circle' && el.radius !== undefined) {
-        ctx.arc(el.x, el.y, Math.abs(el.radius), 0, 2 * Math.PI);
-        if (el.fillColor) {
-          ctx.fillStyle = el.fillColor;
-          ctx.fill();
-        }
-        ctx.stroke();
-      } else if (el.type === 'sticky') {
-        const width = el.width || 180;
-        const height = el.height || 140;
 
-        ctx.shadowBlur = 12;
-        ctx.shadowColor = 'rgba(0, 0, 0, 0.4)';
-        ctx.fillStyle = el.fillColor || 'rgba(30, 41, 59, 0.85)';
-        ctx.strokeStyle = el.strokeColor || '#38bdf8';
-        ctx.lineWidth = 2;
+        if (editingId !== el.id) {
+          ctx.fillStyle = '#0f172a';
+          ctx.font = '16px sans-serif';
 
-        const r = 12;
-        ctx.beginPath();
-        ctx.moveTo(el.x + r, el.y);
-        ctx.lineTo(el.x + width - r, el.y);
-        ctx.quadraticCurveTo(el.x + width, el.y, el.x + width, el.y + r);
-        ctx.lineTo(el.x + width, el.y + height - r);
-        ctx.quadraticCurveTo(el.x + width, el.y + height, el.x + width - r, el.y + height);
-        ctx.lineTo(el.x + r, el.y + height);
-        ctx.quadraticCurveTo(el.x, el.y + height, el.x, el.y + height - r);
-        ctx.lineTo(el.x, el.y + r);
-        ctx.quadraticCurveTo(el.x, el.y, el.x + r, el.y);
-        ctx.closePath();
-        ctx.fill();
-        ctx.stroke();
+          const textContent = el.text || '';
+          const words = textContent.split(' ');
+          let line = '';
+          let posY = el.y + 30;
+          const maxWidth = w - 24;
 
-        ctx.shadowBlur = 0;
-        ctx.fillStyle = '#f8fafc';
-        ctx.font = '600 15px sans-serif';
-
-        const words = (el.text || '').split(' ');
-        let line = '';
-        let lineY = el.y + 32;
-        const maxLineWidth = width - 24;
-
-        for (let n = 0; n < words.length; n++) {
-          const testLine = line + words[n] + ' ';
-          const metrics = ctx.measureText(testLine);
-          if (metrics.width > maxLineWidth && n > 0) {
-            ctx.fillText(line, el.x + 12, lineY);
-            line = words[n] + ' ';
-            lineY += 22;
-          } else {
-            line = testLine;
+          for (let n = 0; n < words.length; n++) {
+            const testLine = line + words[n] + ' ';
+            if (ctx.measureText(testLine).width > maxWidth && n > 0) {
+              ctx.fillText(line, el.x + 12, posY);
+              line = words[n] + ' ';
+              posY += 22;
+            } else {
+              line = testLine;
+            }
           }
+          ctx.fillText(line, el.x + 12, posY);
         }
-        ctx.fillText(line, el.x + 12, lineY);
-      }
+      } else if (el.type === 'path' && el.points && el.points.length > 0) {
+        ctx.strokeStyle = el.color;
+        ctx.lineWidth = Math.max(2, 3 / viewport.scale);
+        ctx.lineCap = 'round';
+        ctx.beginPath();
+        ctx.moveTo(el.points[0].x, el.points[0].y);
+        el.points.forEach((point) => ctx.lineTo(point.x, point.y));
+        ctx.stroke();
+      } else if (el.type === 'circle' && el.x !== undefined && el.y !== undefined && el.radius) {
+        ctx.beginPath();
+        ctx.arc(el.x, el.y, el.radius, 0, Math.PI * 2);
+        ctx.fillStyle = el.color;
+        ctx.fill();
+        ctx.lineWidth = isSelected ? 3 : 2;
+        ctx.strokeStyle = isSelected ? '#38bdf8' : '#ffffff';
+        ctx.stroke();
 
-      if (selectedElementId === el.id) {
-        ctx.strokeStyle = '#f43f5e';
-        ctx.lineWidth = 2;
-        ctx.setLineDash([6, 6]);
-        const padding = 10;
-        if (el.type === 'rectangle' && el.width && el.height) {
-          ctx.strokeRect(el.x - padding, el.y - padding, el.width + padding * 2, el.height + padding * 2);
-        } else if (el.type === 'sticky') {
-          ctx.strokeRect(
-            el.x - padding,
-            el.y - padding,
-            (el.width || 180) + padding * 2,
-            (el.height || 140) + padding * 2
-          );
+        if (isSelected && !isExport) {
+          ctx.fillStyle = '#38bdf8';
+          const handleSize = 10 / viewport.scale;
+          ctx.fillRect(el.x + el.radius - handleSize / 2, el.y - handleSize / 2, handleSize, handleSize);
         }
-        ctx.setLineDash([]);
+      } else if (el.type === 'rectangle' && el.x !== undefined && el.y !== undefined) {
+        const w = el.width || 160;
+        const h = el.height || 100;
+        ctx.fillStyle = el.color;
+        ctx.fillRect(el.x, el.y, w, h);
+        ctx.lineWidth = isSelected ? 3 : 2;
+        ctx.strokeStyle = isSelected ? '#38bdf8' : '#ffffff';
+        ctx.strokeRect(el.x, el.y, w, h);
+
+        if (isSelected && !isExport) {
+          ctx.fillStyle = '#38bdf8';
+          const handleSize = 10 / viewport.scale;
+          ctx.fillRect(el.x + w - handleSize / 2, el.y + h - handleSize / 2, handleSize, handleSize);
+        }
+      } else if (el.type === 'rounded' && el.x !== undefined && el.y !== undefined) {
+        const w = el.width || 160;
+        const h = el.height || 100;
+        const radius = 16;
+        ctx.beginPath();
+        ctx.roundRect(el.x, el.y, w, h, radius);
+        ctx.fillStyle = el.color;
+        ctx.fill();
+        ctx.lineWidth = isSelected ? 3 : 2;
+        ctx.strokeStyle = isSelected ? '#38bdf8' : '#ffffff';
+        ctx.stroke();
+
+        if (isSelected && !isExport) {
+          ctx.fillStyle = '#38bdf8';
+          const handleSize = 10 / viewport.scale;
+          ctx.fillRect(el.x + w - handleSize / 2, el.y + h - handleSize / 2, handleSize, handleSize);
+        }
+      } else if (el.type === 'diamond' && el.x !== undefined && el.y !== undefined) {
+        const w = el.width || 160;
+        const h = el.height || 100;
+        ctx.beginPath();
+        ctx.moveTo(el.x + w / 2, el.y);
+        ctx.lineTo(el.x + w, el.y + h / 2);
+        ctx.lineTo(el.x + w / 2, el.y + h);
+        ctx.lineTo(el.x, el.y + h / 2);
+        ctx.closePath();
+        ctx.fillStyle = el.color;
+        ctx.fill();
+        ctx.lineWidth = isSelected ? 3 : 2;
+        ctx.strokeStyle = isSelected ? '#38bdf8' : '#ffffff';
+        ctx.stroke();
+
+        if (isSelected && !isExport) {
+          ctx.fillStyle = '#38bdf8';
+          const handleSize = 10 / viewport.scale;
+          ctx.fillRect(el.x + w - handleSize / 2, el.y + h - handleSize / 2, handleSize, handleSize);
+        }
       }
     });
 
     ctx.restore();
-  }, [elements, currentElement, panOffset, zoomScale, selectedElementId]);
+  };
 
   useEffect(() => {
+    if (!currentUser) return;
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+
+    const handleResize = () => {
+      const dpr = window.devicePixelRatio || 1;
+      canvas.width = window.innerWidth * dpr;
+      canvas.height = window.innerHeight * dpr;
+      canvas.style.width = `${window.innerWidth}px`;
+      canvas.style.height = `${window.innerHeight}px`;
+      renderCanvas();
+    };
+
+    handleResize();
+    window.addEventListener('resize', handleResize);
     renderCanvas();
-  }, [renderCanvas]);
 
-  const handleMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
-    if (activeTool === 'pan') {
-      setIsPanning(true);
-      setStartPan({ x: e.clientX - panOffset.x, y: e.clientY - panOffset.y });
-      return;
-    }
+    return () => {
+      window.removeEventListener('resize', handleResize);
+    };
+  }, [currentUser, viewport, elements, selectedId, editingId, bgColor]);
 
-    const coords = getCanvasCoordinates(e);
-    setIsDrawing(true);
+  const getCenterWorldPos = () => ({
+    x: (window.innerWidth / 2 - viewport.x) / viewport.scale,
+    y: (window.innerHeight / 2 - viewport.y) / viewport.scale,
+  });
 
-    if (activeTool === 'select') {
-      const clicked = elements.slice().reverse().find((el) => {
-        if (el.type === 'rectangle' || el.type === 'sticky') {
-          const w = el.width || 180;
-          const h = el.height || 140;
-          return coords.x >= el.x && coords.x <= el.x + w && coords.y >= el.y && coords.y <= el.y + h;
+  const addShape = (type: 'sticky' | 'circle' | 'rectangle' | 'rounded' | 'diamond') => {
+    const id = Math.random().toString(36).substring(2, 9);
+    const pos = getCenterWorldPos();
+    const defaultW = Math.max(180, (window.innerWidth * 0.15) / viewport.scale);
+    const defaultH = Math.max(140, (window.innerHeight * 0.15) / viewport.scale);
+
+    elementsMapRef.current?.set(id, {
+      id,
+      type,
+      x: pos.x - defaultW / 2,
+      y: pos.y - defaultH / 2,
+      width: defaultW,
+      height: defaultH,
+      radius: type === 'circle' ? defaultW / 3 : undefined,
+      text: type === 'sticky' ? 'Double click to edit' : undefined,
+      color: shapeFillColor,
+    });
+  };
+
+  const getElementHitInfo = (worldX: number, worldY: number) => {
+    const handleThreshold = 14 / viewport.scale;
+
+    for (let i = elements.length - 1; i >= 0; i--) {
+      const el = elements[i];
+      if (el.type === 'sticky' || el.type === 'rectangle' || el.type === 'rounded' || el.type === 'diamond') {
+        const w = el.width || 160;
+        const h = el.height || 100;
+        if (el.x === undefined || el.y === undefined) continue;
+
+        const handleX = el.x + w;
+        const handleY = el.y + h;
+        if (Math.abs(worldX - handleX) <= handleThreshold && Math.abs(worldY - handleY) <= handleThreshold) {
+          return { element: el, isResizeHandle: true };
         }
-        return false;
-      });
-      setSelectedElementId(clicked ? clicked.id : null);
-      setIsDrawing(false);
-      return;
+
+        if (worldX >= el.x && worldX <= el.x + w && worldY >= el.y && worldY <= el.y + h) {
+          return { element: el, isResizeHandle: false };
+        }
+      } else if (el.type === 'circle' && el.radius) {
+        if (el.x === undefined || el.y === undefined) continue;
+        const dx = worldX - el.x;
+        const dy = worldY - el.y;
+
+        const handleX = el.x + el.radius;
+        const handleY = el.y;
+        if (Math.abs(worldX - handleX) <= handleThreshold && Math.abs(worldY - handleY) <= handleThreshold) {
+          return { element: el, isResizeHandle: true };
+        }
+
+        if (Math.sqrt(dx * dx + dy * dy) <= el.radius) {
+          return { element: el, isResizeHandle: false };
+        }
+      }
     }
+    return null;
+  };
 
-    const newId = Date.now().toString();
+  const handleMouseDown = (e: React.MouseEvent) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    const worldX = (e.clientX - rect.left - viewport.x) / viewport.scale;
+    const worldY = (e.clientY - rect.top - viewport.y) / viewport.scale;
 
-    if (activeTool === 'pen') {
-      setCurrentElement({
-        id: newId,
-        type: 'pen',
-        x: coords.x,
-        y: coords.y,
-        strokeColor,
-        lineWidth,
-        points: [{ x: coords.x, y: coords.y }]
-      });
-    } else if (activeTool === 'rectangle') {
-      setCurrentElement({
-        id: newId,
-        type: 'rectangle',
-        x: coords.x,
-        y: coords.y,
-        width: 0,
-        height: 0,
-        strokeColor,
-        fillColor: 'rgba(56, 189, 248, 0.1)',
-        lineWidth
-      });
-    } else if (activeTool === 'circle') {
-      setCurrentElement({
-        id: newId,
-        type: 'circle',
-        x: coords.x,
-        y: coords.y,
-        radius: 0,
-        strokeColor,
-        fillColor: 'rgba(168, 85, 247, 0.1)',
-        lineWidth
-      });
-    } else if (activeTool === 'sticky') {
-      const newSticky: CanvasElement = {
-        id: newId,
-        type: 'sticky',
-        x: coords.x - 90,
-        y: coords.y - 70,
-        width: 180,
-        height: 140,
-        strokeColor,
-        fillColor: 'rgba(15, 23, 42, 0.9)',
-        lineWidth: 2,
-        text: stickyText || 'Cosmic Idea ✨'
-      };
-      saveToHistory([...elements, newSticky]);
-      setIsDrawing(false);
-    } else if (activeTool === 'eraser') {
-      const filtered = elements.filter((el) => {
-        const dist = Math.hypot(el.x - coords.x, el.y - coords.y);
-        return dist > 30;
-      });
-      saveToHistory(filtered);
-      setIsDrawing(false);
+    setIsInteracting(true);
+
+    if (activeTool === 'pan' || e.button === 1) {
+      setStartPan({ x: e.clientX - viewport.x, y: e.clientY - viewport.y });
+    } else if (activeTool === 'draw') {
+      setCurrentPath([{ x: worldX, y: worldY }]);
+    } else if (activeTool === 'select') {
+      const hit = getElementHitInfo(worldX, worldY);
+      if (hit) {
+        setSelectedId(hit.element.id);
+        if (hit.isResizeHandle) {
+          setIsResizing(true);
+        } else if (hit.element.x !== undefined && hit.element.y !== undefined) {
+          setIsResizing(false);
+          setDragOffset({ x: worldX - hit.element.x, y: worldY - hit.element.y });
+        }
+      } else {
+        setSelectedId(null);
+        setEditingId(null);
+        setIsResizing(false);
+      }
     }
   };
 
-  const handleMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
-    if (isPanning) {
-      setPanOffset({
-        x: e.clientX - startPan.x,
-        y: e.clientY - startPan.y
-      });
-      return;
+  const handleDoubleClick = (e: React.MouseEvent) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    const worldX = (e.clientX - rect.left - viewport.x) / viewport.scale;
+    const worldY = (e.clientY - rect.top - viewport.y) / viewport.scale;
+
+    const hit = getElementHitInfo(worldX, worldY);
+    if (hit && hit.element.type === 'sticky') {
+      setEditingId(hit.element.id);
+      setEditText(hit.element.text || '');
     }
+  };
 
-    if (!isDrawing || !currentElement) return;
-    const coords = getCanvasCoordinates(e);
+  const handleMouseMove = (e: React.MouseEvent) => {
+    if (!isInteracting) return;
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    const worldX = (e.clientX - rect.left - viewport.x) / viewport.scale;
+    const worldY = (e.clientY - rect.top - viewport.y) / viewport.scale;
 
-    if (currentElement.type === 'pen' && currentElement.points) {
-      setCurrentElement({
-        ...currentElement,
-        points: [...currentElement.points, { x: coords.x, y: coords.y }]
+    if (activeTool === 'pan' || e.buttons === 4) {
+      setViewport((prev) => ({
+        ...prev,
+        x: e.clientX - startPan.x,
+        y: e.clientY - startPan.y,
+      }));
+    } else if (activeTool === 'draw') {
+      const updatedPath = [...currentPath, { x: worldX, y: worldY }];
+      setCurrentPath(updatedPath);
+
+      elementsMapRef.current?.set('temp-path', {
+        id: 'temp-path',
+        type: 'path',
+        color: brushColor,
+        points: updatedPath,
       });
-    } else if (currentElement.type === 'rectangle') {
-      setCurrentElement({
-        ...currentElement,
-        width: coords.x - currentElement.x,
-        height: coords.y - currentElement.y
-      });
-    } else if (currentElement.type === 'circle') {
-      const rad = Math.hypot(coords.x - currentElement.x, coords.y - currentElement.y);
-      setCurrentElement({
-        ...currentElement,
-        radius: rad
-      });
+    } else if (activeTool === 'select' && selectedId) {
+      const existing = elementsMapRef.current?.get(selectedId);
+      if (!existing) return;
+
+      if (isResizing) {
+        if (existing.type === 'circle' && existing.x !== undefined) {
+          const newRadius = Math.max(10, Math.abs(worldX - existing.x));
+          elementsMapRef.current?.set(selectedId, {
+            ...existing,
+            radius: newRadius,
+          });
+        } else if (existing.x !== undefined && existing.y !== undefined) {
+          const newWidth = Math.max(40, worldX - existing.x);
+          const newHeight = Math.max(40, worldY - existing.y);
+          elementsMapRef.current?.set(selectedId, {
+            ...existing,
+            width: newWidth,
+            height: newHeight,
+          });
+        }
+      } else if (!isResizing) {
+        elementsMapRef.current?.set(selectedId, {
+          ...existing,
+          x: worldX - dragOffset.x,
+          y: worldY - dragOffset.y,
+        });
+      }
     }
   };
 
   const handleMouseUp = () => {
-    if (isPanning) {
-      setIsPanning(false);
-      return;
-    }
-    if (isDrawing && currentElement) {
-      saveToHistory([...elements, currentElement]);
-      setCurrentElement(null);
-      setIsDrawing(false);
+    if (!isInteracting) return;
+    setIsInteracting(false);
+    setIsResizing(false);
+
+    if (activeTool === 'draw' && currentPath.length > 0) {
+      const uniqueId = Math.random().toString(36).substring(2, 9);
+      elementsMapRef.current?.set(uniqueId, {
+        id: uniqueId,
+        type: 'path',
+        color: brushColor,
+        points: currentPath,
+      });
+      elementsMapRef.current?.delete('temp-path');
+      setCurrentPath([]);
     }
   };
 
-  const handleWheel = (e: React.WheelEvent<HTMLCanvasElement>) => {
+  const handleWheel = (e: React.WheelEvent) => {
     e.preventDefault();
-    const zoomFactor = e.deltaY < 0 ? 1.08 : 0.92;
-    const newZoom = Math.max(0.2, Math.min(4, zoomScale * zoomFactor));
-    setZoomScale(newZoom);
+    const zoomFactor = e.deltaY < 0 ? 1.15 : 0.85;
+    setViewport((prev) => ({ ...prev, scale: prev.scale * zoomFactor }));
   };
 
-  const handleUndo = () => {
-    if (historyIndex > 0) {
-      setHistoryIndex(historyIndex - 1);
-      setElements(history[historyIndex - 1]);
+  const zoomIn = () => setViewport((prev) => ({ ...prev, scale: prev.scale * 1.25 }));
+  const zoomOut = () => setViewport((prev) => ({ ...prev, scale: prev.scale / 1.25 }));
+  const resetZoom = () => setViewport({ x: 0, y: 0, scale: 1 });
+
+  const saveTextEdit = () => {
+    if (editingId) {
+      const existing = elementsMapRef.current?.get(editingId);
+      if (existing) {
+        elementsMapRef.current?.set(editingId, {
+          ...existing,
+          text: editText,
+        });
+      }
+      setEditingId(null);
     }
   };
 
-  const handleRedo = () => {
-    if (historyIndex < history.length - 1) {
-      setHistoryIndex(historyIndex + 1);
-      setElements(history[historyIndex + 1]);
+  const saveCanvasToMongoDB = async () => {
+    try {
+      const response = await fetch('http://localhost:5000/api/save', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          roomName: 'whitesplash-room-alpha',
+          elements: elements,
+        }),
+      });
+      if (response.ok) {
+        alert('☁️ Canvas progress saved to MongoDB!');
+      } else {
+        alert('Failed to save to database.');
+      }
+    } catch (err) {
+      alert('Error connecting to backend server.');
     }
   };
 
-  const exportCanvasImage = () => {
+  const loadCanvasFromMongoDB = async () => {
+    try {
+      const response = await fetch('http://localhost:5000/api/load/whitesplash-room-alpha');
+      if (response.ok) {
+        const data = await response.json();
+        if (data && data.elements) {
+          elementsMapRef.current?.clear();
+          data.elements.forEach((el: CanvasElement) => {
+            elementsMapRef.current?.set(el.id, el);
+          });
+          alert('📂 Canvas progress loaded from MongoDB!');
+        }
+      } else {
+        alert('No previous save found in database.');
+      }
+    } catch (err) {
+      alert('Error connecting to backend server.');
+    }
+  };
+
+  const exportCanvasAsPNG = () => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-    const imageURI = canvas.toDataURL('image/png');
-    const link = document.createElement('a');
-    link.download = 'The-Shared-Sanctum-Cosmic-Canvas.png';
-    link.href = imageURI;
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-  };
-
-  const handleClear = () => {
-    if (window.confirm('Clear all celestial drawings?')) {
-      saveToHistory([]);
+    const tempCanvas = document.createElement('canvas');
+    tempCanvas.width = canvas.width;
+    tempCanvas.height = canvas.height;
+    const tempCtx = tempCanvas.getContext('2d');
+    if (tempCtx) {
+      renderCanvas(tempCtx, true);
+      const link = document.createElement('a');
+      link.download = 'whitesplash-canvas.png';
+      link.href = tempCanvas.toDataURL('image/png');
+      link.click();
     }
   };
 
-  return (
-    <div className="sanctum-wrapper" ref={containerRef}>
-      {/* Top Header Navigation Bar */}
-      <header className="sanctum-header">
-        <div className="brand-section">
-          <svg className="sparkle-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="m12 3-1.9 5.8-5.8 1.9 5.8 1.9 1.9 5.8 1.9-5.8 5.8-1.9-5.8-1.9z"/></svg>
-          <h1 className="brand-title">The Shared Sanctum</h1>
-          <span className="badge-live">GALAXY CRDT LIVE</span>
-        </div>
+  const toggleVideoCall = async () => {
+    if (!isVideoActive) {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+        mediaStreamRef.current = stream;
+        setIsVideoActive(true);
+        providerRef.current?.awareness.setLocalStateField('hasVideo', true);
 
-        <div className="peer-badge">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#10b981" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
-          <span>{peers.length + 1} Explorers Connected</span>
-        </div>
+        setTimeout(() => {
+          if (localVideoRef.current) {
+            localVideoRef.current.srcObject = stream;
+          }
+        }, 100);
+      } catch (err) {
+        alert('Camera access denied or device unavailable.');
+      }
+    } else {
+      if (mediaStreamRef.current) {
+        mediaStreamRef.current.getTracks().forEach((track) => track.stop());
+        mediaStreamRef.current = null;
+      }
+      if (localVideoRef.current) {
+        localVideoRef.current.srcObject = null;
+      }
+      setIsVideoActive(false);
+      providerRef.current?.awareness.setLocalStateField('hasVideo', false);
+    }
+  };
 
-        <div className="header-actions">
-          <button className="btn-icon" onClick={handleUndo} disabled={historyIndex <= 0} title="Undo (Ctrl+Z)">
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 7v6h6"/><path d="M21 17a9 9 0 0 0-9-9 9 9 0 0 0-6 2.3L3 13"/></svg>
+  if (!currentUser) {
+    return (
+      <div style={{ width: '100vw', height: '100vh', display: 'flex', justifyContent: 'center', alignItems: 'center', background: '#0f172a', fontFamily: 'sans-serif' }}>
+        <form
+          onSubmit={(e) => {
+            e.preventDefault();
+            if (usernameInput.trim() && passwordInput.trim()) {
+              setCurrentUser(usernameInput.trim());
+            }
+          }}
+          style={{ background: '#1e293b', padding: '40px', borderRadius: '16px', border: '1px solid #334155', width: '320px', boxShadow: '0 25px 50px -12px rgba(0, 0, 0, 0.5)', color: '#fff' }}
+        >
+          <h2 style={{ color: '#38bdf8', marginBottom: '24px', textAlign: 'center' }}>✦ WhiteSplash ✦</h2>
+          <div style={{ marginBottom: '16px' }}>
+            <label style={{ display: 'block', color: '#94a3b8', fontSize: '13px', marginBottom: '6px' }}>Username</label>
+            <input
+              type="text"
+              value={usernameInput}
+              onChange={(e) => setUsernameInput(e.target.value)}
+              required
+              style={{ width: '100%', padding: '10px', background: '#0f172a', border: '1px solid #475569', borderRadius: '8px', color: '#fff', outline: 'none' }}
+            />
+          </div>
+          <div style={{ marginBottom: '24px' }}>
+            <label style={{ display: 'block', color: '#94a3b8', fontSize: '13px', marginBottom: '6px' }}>Password</label>
+            <input
+              type="password"
+              value={passwordInput}
+              onChange={(e) => setPasswordInput(e.target.value)}
+              required
+              style={{ width: '100%', padding: '10px', background: '#0f172a', border: '1px solid #475569', borderRadius: '8px', color: '#fff', outline: 'none' }}
+            />
+          </div>
+          <button type="submit" style={{ width: '100%', padding: '12px', background: '#3b82f6', color: '#fff', border: 'none', borderRadius: '8px', fontWeight: 'bold', cursor: 'pointer' }}>
+            Enter Canvas
           </button>
-          <button className="btn-icon" onClick={handleRedo} disabled={historyIndex >= history.length - 1} title="Redo (Ctrl+Y)">
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 7v6h-6"/><path d="M3 17a9 9 0 0 1 9-9 9 9 0 0 1 6 2.3l3 2.7"/></svg>
-          </button>
-          <div className="divider"></div>
-          <button className={`btn-primary ${isVideoOn ? 'active' : ''}`} onClick={toggleCamera}>
-            {isVideoOn ? (
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="1" y1="1" x2="23" y2="23"/><path d="M21 21H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h3m3-3h6l2 3h4a2 2 0 0 1 2 2v9.34m-7.72-2.72a4 4 0 1 1-5.56-5.56"/></svg>
-            ) : (
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2" ry="2"/></svg>
-            )}
-            <span>{isVideoOn ? 'Stop Camera' : 'Live Camera'}</span>
-          </button>
-          <button className="btn-export" onClick={exportCanvasImage}>
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
-            <span>Export Starry PNG</span>
-          </button>
-        </div>
-      </header>
-
-      {/* Floating Toolbar */}
-      <div className="sanctum-toolbar">
-        <button
-          className={`tool-btn ${activeTool === 'select' ? 'selected' : ''}`}
-          onClick={() => setActiveTool('select')}
-          title="Select Object"
-        >
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="m3 3 7.07 16.97 2.51-7.39 7.39-2.51L3 3z"/><path d="m13 13 6 6"/></svg>
-        </button>
-        <button
-          className={`tool-btn ${activeTool === 'pan' ? 'selected' : ''}`}
-          onClick={() => setActiveTool('pan')}
-          title="Pan Canvas"
-        >
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M18 11V6a2 2 0 0 0-2-2v0a2 2 0 0 0-2 2v0"/><path d="M14 10V4a2 2 0 0 0-2-2v0a2 2 0 0 0-2 2v2"/><path d="M10 10.5V6a2 2 0 0 0-2-2v0a2 2 0 0 0-2 2v8"/><path d="M18 8a2 2 0 1 1 4 0v6a8 8 0 0 1-8 8h-2c-2.8 0-4.5-.86-5.99-2.34l-3.6-3.6a2 2 0 0 1 2.83-2.82L7 15"/></svg>
-        </button>
-        <button
-          className={`tool-btn ${activeTool === 'pen' ? 'selected' : ''}`}
-          onClick={() => setActiveTool('pen')}
-          title="Neon Brush"
-        >
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"/></svg>
-        </button>
-        <button
-          className={`tool-btn ${activeTool === 'rectangle' ? 'selected' : ''}`}
-          onClick={() => setActiveTool('rectangle')}
-          title="Rectangle"
-        >
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/></svg>
-        </button>
-        <button
-          className={`tool-btn ${activeTool === 'circle' ? 'selected' : ''}`}
-          onClick={() => setActiveTool('circle')}
-          title="Orb / Circle"
-        >
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/></svg>
-        </button>
-        <button
-          className={`tool-btn ${activeTool === 'sticky' ? 'selected' : ''}`}
-          onClick={() => setActiveTool('sticky')}
-          title="Cosmic Sticky Note"
-        >
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M15.5 3H5a2 2 0 0 0-2 2v14c0 1.1.9 2 2 2h14a2 2 0 0 0 2-2V8.5L15.5 3Z"/><path d="M15 3v6h6"/></svg>
-        </button>
-        <button
-          className={`tool-btn ${activeTool === 'eraser' ? 'selected' : ''}`}
-          onClick={() => setActiveTool('eraser')}
-          title="Eraser"
-        >
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="m7 21-4.3-4.3c-1-1-1-2.5 0-3.4l9.6-9.6c1-1 2.5-1 3.4 0l5.6 5.6c1 1 1 2.5 0 3.4L13 21"/><path d="M22 21H7"/><path d="m5 11 9 9"/></svg>
-        </button>
-
-        <div className="divider-vertical"></div>
-
-        <div className="color-picker-container" title="Choose Neon Aura Color">
-          <svg className="color-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="13.5" cy="6.5" r=".5"/><circle cx="17.5" cy="10.5" r=".5"/><circle cx="8.5" cy="7.5" r=".5"/><circle cx="6.5" cy="12.5" r=".5"/><path d="M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10c0-1.5 1.5-3 3-3s3 1.5 3 3c2.8 0 5-2.2 5-5 0-4.4-3.6-8-8-8z"/></svg>
-          <input
-            type="color"
-            value={strokeColor}
-            onChange={(e) => setStrokeColor(e.target.value)}
-            className="color-picker-input"
-          />
-        </div>
-
-        {activeTool === 'pen' && (
-          <input
-            type="range"
-            min="2"
-            max="24"
-            value={lineWidth}
-            onChange={(e) => setLineWidth(Number(e.target.value))}
-            className="stroke-slider"
-            title="Stroke Thickness"
-          />
-        )}
-
-        {activeTool === 'sticky' && (
-          <input
-            type="text"
-            value={stickyText}
-            onChange={(e) => setStickyText(e.target.value)}
-            placeholder="Sticky text..."
-            className="sticky-input"
-          />
-        )}
-
-        <div className="divider-vertical"></div>
-
-        <button className="tool-btn danger" onClick={handleClear} title="Clear Everything">
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg>
-        </button>
+        </form>
       </div>
+    );
+  }
+
+  const activeEditingElement = elements.find((el) => el.id === editingId);
+  const editingScreenBounds = activeEditingElement && activeEditingElement.x !== undefined && activeEditingElement.y !== undefined ? {
+    left: activeEditingElement.x * viewport.scale + viewport.x + 12,
+    top: activeEditingElement.y * viewport.scale + viewport.y + 12,
+    width: (activeEditingElement.width || 200) * viewport.scale - 24,
+    height: (activeEditingElement.height || 160) * viewport.scale - 24,
+  } : null;
+
+  return (
+    <div style={{ width: '100vw', height: '100vh', overflow: 'hidden', background: bgColor, position: 'relative', fontFamily: 'sans-serif' }}>
+      
+      {/* toolbar */}
+      <div style={{ position: 'fixed', top: 20, left: 20, zIndex: 9999, pointerEvents: 'auto', display: 'flex', gap: '8px', alignItems: 'center', background: '#1e293b', padding: '10px 14px', borderRadius: '12px', border: '1px solid #334155', boxShadow: '0 10px 25px rgba(0,0,0,0.4)', flexWrap: 'wrap' }}>
+        <button onClick={() => setActiveTool('pan')} style={{ padding: '8px 12px', background: activeTool === 'pan' ? '#3b82f6' : '#334155', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold' }}>
+          ✋ Pan
+        </button>
+        <button onClick={() => setActiveTool('select')} style={{ padding: '8px 12px', background: activeTool === 'select' ? '#3b82f6' : '#334155', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold' }}>
+          ↖ Select & Resize
+        </button>
+        <button onClick={() => setActiveTool('draw')} style={{ padding: '8px 12px', background: activeTool === 'draw' ? '#3b82f6' : '#334155', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold' }}>
+          ✏️ Draw
+        </button>
+
+        <div style={{ width: '1px', height: '24px', background: '#475569', margin: '0 2px' }} />
+
+        <button onClick={() => addShape('sticky')} style={{ padding: '8px 10px', background: '#10b981', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold' }}>
+          + Sticky
+        </button>
+        <button onClick={() => addShape('circle')} style={{ padding: '8px 10px', background: '#ec4899', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold' }}>
+          ⭕ Circle
+        </button>
+        <button onClick={() => addShape('rectangle')} style={{ padding: '8px 10px', background: '#8b5cf6', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold' }}>
+          🟦 Rect
+        </button>
+        <button onClick={() => addShape('rounded')} style={{ padding: '8px 10px', background: '#f59e0b', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold' }}>
+          🔲 Rounded
+        </button>
+        <button onClick={() => addShape('diamond')} style={{ padding: '8px 10px', background: '#06b6d4', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold' }}>
+          🔶 Diamond
+        </button>
+
+        <input type="color" value={shapeFillColor} onChange={(e) => setShapeFillColor(e.target.value)} title="Shape Fill Color" style={{ width: '28px', height: '28px', border: 'none', cursor: 'pointer', background: 'none' }} />
+
+        {activeTool === 'draw' && (
+          <input type="color" value={brushColor} onChange={(e) => setBrushColor(e.target.value)} title="Brush Color" style={{ width: '28px', height: '28px', border: 'none', cursor: 'pointer', background: 'none' }} />
+        )}
+
+        <div style={{ width: '1px', height: '24px', background: '#475569', margin: '0 2px' }} />
+
+        <input type="color" value={bgColor} onChange={(e) => setBgColor(e.target.value)} title="Canvas Background Color" style={{ width: '28px', height: '28px', border: 'none', cursor: 'pointer', background: 'none' }} />
+
+        <div style={{ width: '1px', height: '24px', background: '#475569', margin: '0 2px' }} />
+
+        <button onClick={() => undoManagerRef.current?.undo()} title="Undo (Ctrl+Z)" style={{ padding: '8px 10px', background: '#334155', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold' }}>
+          ↩
+        </button>
+        <button onClick={() => undoManagerRef.current?.redo()} title="Redo (Ctrl+Y)" style={{ padding: '8px 10px', background: '#334155', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold' }}>
+          ↪
+        </button>
+
+        <div style={{ width: '1px', height: '24px', background: '#475569', margin: '0 2px' }} />
+
+        <button onClick={saveCanvasToMongoDB} style={{ padding: '8px 10px', background: '#059669', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold' }}>
+          ☁️ Save DB
+        </button>
+        <button onClick={loadCanvasFromMongoDB} style={{ padding: '8px 10px', background: '#4f46e5', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold' }}>
+          📂 Load DB
+        </button>
+
+        <div style={{ width: '1px', height: '24px', background: '#475569', margin: '0 2px' }} />
+
+        <button onClick={exportCanvasAsPNG} style={{ padding: '8px 12px', background: '#0284c7', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold' }}>
+          💾 PNG
+        </button>
+        <button onClick={toggleVideoCall} style={{ padding: '8px 12px', background: isVideoActive ? '#ef4444' : '#8b5cf6', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold' }}>
+          {isVideoActive ? '🔴 End Cam' : '📹 Cam'}
+        </button>
+
+        <div style={{ padding: '6px 10px', background: '#0f172a', color: '#38bdf8', borderRadius: '6px', border: '1px solid #334155', fontSize: '13px', fontWeight: 500 }}>
+          Online: {activeUsers} ({currentUser})
+        </div>
+      </div>
+
+      {/* zoom controls */}
+      <div style={{ position: 'fixed', bottom: 20, left: 20, zIndex: 9999, pointerEvents: 'auto', display: 'flex', gap: '8px', background: '#1e293b', padding: '8px 12px', borderRadius: '10px', border: '1px solid #334155', boxShadow: '0 10px 25px rgba(0,0,0,0.4)', alignItems: 'center' }}>
+        <button onClick={zoomOut} style={{ padding: '6px 12px', background: '#334155', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold', fontSize: '16px' }}>－</button>
+        <span style={{ color: '#38bdf8', fontSize: '13px', fontWeight: 'bold', minWidth: '55px', textAlign: 'center' }}>{Math.round(viewport.scale * 100)}%</span>
+        <button onClick={zoomIn} style={{ padding: '6px 12px', background: '#334155', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold', fontSize: '16px' }}>＋</button>
+        <button onClick={resetZoom} style={{ padding: '6px 10px', background: '#475569', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold', fontSize: '12px' }}>Reset</button>
+      </div>
+
+      {/* camera preview grid */}
+      <div style={{ position: 'fixed', bottom: 20, right: 20, zIndex: 9999, pointerEvents: 'auto', display: 'flex', gap: '10px', flexWrap: 'wrap', maxWidth: '440px', justifyContent: 'flex-end' }}>
+        {isVideoActive && (
+          <div style={{ background: '#1e293b', padding: '6px', borderRadius: '12px', border: '2px solid #8b5cf6', boxShadow: '0 10px 25px rgba(0,0,0,0.5)' }}>
+            <video ref={localVideoRef} autoPlay playsInline muted style={{ width: '180px', height: '120px', borderRadius: '8px', objectFit: 'cover', transform: 'scaleX(-1)', display: 'block' }} />
+            <div style={{ color: '#fff', fontSize: '11px', textAlign: 'center', marginTop: '4px', fontWeight: 'bold' }}>{currentUser} (You)</div>
+          </div>
+        )}
+        {peerStates.filter(() => isVideoActive).map((_, idx) => (
+          <div key={idx} style={{ background: '#1e293b', padding: '6px', borderRadius: '12px', border: '2px solid #10b981', boxShadow: '0 10px 25px rgba(0,0,0,0.5)' }}>
+            <div style={{ width: '180px', height: '120px', borderRadius: '8px', background: '#0f172a', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#10b981', fontWeight: 'bold', fontSize: '13px' }}>
+              📹 Peer Stream #{idx + 1}
+            </div>
+            <div style={{ color: '#fff', fontSize: '11px', textAlign: 'center', marginTop: '4px', fontWeight: 'bold' }}>Collaborator #{idx + 1}</div>
+          </div>
+        ))}
+      </div>
+
+      {/* inline textarea overlay */}
+      {editingId && editingScreenBounds && (
+        <textarea
+          autoFocus
+          value={editText}
+          onChange={(e) => setEditText(e.target.value)}
+          onBlur={saveTextEdit}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter' && !e.shiftKey) {
+              e.preventDefault();
+              saveTextEdit();
+            }
+          }}
+          style={{
+            position: 'fixed',
+            left: `${editingScreenBounds.left}px`,
+            top: `${editingScreenBounds.top}px`,
+            width: `${editingScreenBounds.width}px`,
+            height: `${editingScreenBounds.height}px`,
+            fontSize: '16px',
+            fontFamily: 'sans-serif',
+            color: '#0f172a',
+            background: 'transparent',
+            border: '1px dashed #0f172a',
+            outline: 'none',
+            resize: 'none',
+            zIndex: 10000,
+          }}
+        />
+      )}
 
       <canvas
         ref={canvasRef}
-        className={`sanctum-canvas ${activeTool === 'pan' ? 'cursor-grab' : 'cursor-crosshair'}`}
         onMouseDown={handleMouseDown}
         onMouseMove={handleMouseMove}
         onMouseUp={handleMouseUp}
+        onDoubleClick={handleDoubleClick}
         onWheel={handleWheel}
+        style={{ display: 'block', cursor: activeTool === 'pan' ? 'grab' : activeTool === 'draw' ? 'crosshair' : 'default' }}
       />
-
-      {peers.map((peer) => (
-        <div
-          key={peer.id}
-          className="peer-cursor"
-          style={{
-            transform: `translate3d(${peer.x}px, ${peer.y}px, 0px)`,
-            backgroundColor: peer.color
-          }}
-        >
-          <span className="peer-label">{peer.name}</span>
-        </div>
-      ))}
-
-      {isVideoOn && (
-        <div className="camera-widget">
-          <div className="camera-header">
-            <span>Explorer Feed</span>
-            <span className="live-dot"></span>
-          </div>
-          <video ref={videoRef} autoPlay playsInline muted className="camera-video" />
-        </div>
-      )}
-
-      <div className="zoom-controls">
-        <button onClick={() => setZoomScale((z) => Math.min(4, z + 0.15))} title="Zoom In">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><line x1="11" y1="8" x2="11" y2="14"/><line x1="8" y1="11" x2="14" y2="11"/></svg>
-        </button>
-        <span className="zoom-percentage">{Math.round(zoomScale * 100)}%</span>
-        <button onClick={() => setZoomScale((z) => Math.max(0.2, z - 0.15))} title="Zoom Out">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><line x1="8" y1="11" x2="14" y2="11"/></svg>
-        </button>
-        <button
-          onClick={() => {
-            setZoomScale(1);
-            setPanOffset({ x: 0, y: 0 });
-          }}
-          title="Reset Viewport"
-        >
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/></svg>
-        </button>
-      </div>
     </div>
   );
-};
-
-export default App;
+}
