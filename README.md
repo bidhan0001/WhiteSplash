@@ -1,3 +1,35 @@
+# ✦ WhiteSplash ✦
+
+A real-time collaborative infinite canvas application built with **React**, **Vite**, **Node.js**, **Express**, **MongoDB**, and **Yjs**. WhiteSplash allows multiple users to draw, brainstorm with sticky notes, create shapes, and collaborate in real time with live video streams and persistent cloud storage.
+
+---
+
+## 🚀 Features
+
+- **Infinite Canvas & Viewport Controls**: Smooth panning, zooming, and customizable canvas backgrounds.
+- **Real-Time Collaboration**: Powered by WebSockets and Yjs for live multi-user cursor and element synchronization.
+- **Custom Shapes & Sticky Notes**: Draw freehand paths, rectangles, circles, rounded boxes, diamonds, and double-click editable sticky notes.
+- **Database Persistence**: Save and restore canvas states securely to/from MongoDB.
+- **Video Chat Integration**: Built-in peer video streaming preview for collaborators.
+- **Secure Authentication Gate**: Clean login screen gate before accessing the collaborative workspace.
+
+---
+
+## 🛠️ Tech Stack
+
+- **Frontend**: React, Vite, HTML5 Canvas API, Yjs, `y-websocket`
+- **Backend**: Node.js, Express, Mongoose, CORS
+- **Database**: MongoDB / MongoDB Atlas
+
+---
+
+## 📦 Project Setup & Installation
+
+### 1. Clone the Repository
+```bash
+git clone [https://github.com/bidhan0001/whitesplash.git](https://github.com/your-username/whitesplash.git)
+cd whitesplash
+
 # React + TypeScript + Vite
 
 This template provides a minimal setup to get React working in Vite with HMR and some Oxlint rules.
